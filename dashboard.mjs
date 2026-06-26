@@ -98,17 +98,30 @@ const DEFAULT_SETTINGS = {
   notifications: true,
   serializeRequests: false,
   serializeDelayMs: 200,
+  maxConcurrentPerAccount: 8, // balance mode: max concurrent in-flight requests per account
+  balanceWaitMs: 10000,       // balance mode: wait for a freed slot before overflowing
   commitTokenUsage: false,
   sessionMonitor: false,
 };
 
 function loadSettings() {
+  let s = { ...DEFAULT_SETTINGS };
   try {
     if (existsSync(CONFIG_FILE)) {
-      return { ...DEFAULT_SETTINGS, ...JSON.parse(readFileSync(CONFIG_FILE, 'utf8')) };
+      s = { ...DEFAULT_SETTINGS, ...JSON.parse(readFileSync(CONFIG_FILE, 'utf8')) };
     }
   } catch { /* corrupt file  - use defaults */ }
-  return { ...DEFAULT_SETTINGS };
+  return clampSettings(s);
+}
+
+// Clamp numeric balance settings even when set via a hand-edited config.json
+// (the API validates these, but loadSettings spreads the raw file). Keeps the
+// per-request slot wait safely under REQUEST_DEADLINE_MS (45s).
+function clampSettings(s) {
+  const n = (v, def, lo, hi) => (typeof v === 'number' && isFinite(v) ? Math.min(Math.max(v, lo), hi) : def);
+  s.maxConcurrentPerAccount = Math.floor(n(s.maxConcurrentPerAccount, 8, 1, 50));
+  s.balanceWaitMs = n(s.balanceWaitMs, 10000, 0, 30000);
+  return s;
 }
 
 function saveSettings(settings) {
@@ -192,9 +205,11 @@ import {
   buildForwardHeaders as _buildForwardHeaders,
   stripHopByHopHeaders,
   createAccountStateManager,
+  createBalanceLimiter,
   isAccountAvailable as _isAccountAvailable,
   scoreAccount as _scoreAccount,
   pickBestAccount as _pickBestAccount,
+  pickLeastLoaded as _pickLeastLoaded,
   pickDrainFirst as _pickDrainFirst,
   pickConserve as _pickConserve,
   pickAnyUntried as _pickAnyUntried,
@@ -325,9 +340,12 @@ async function autoDiscoverAccount() {
     files = [];
   }
 
-  // Resolve email for the new token so we can deduplicate by identity
+  // Resolve email for the new token so we can deduplicate by identity.
+  // Use the cached resolver (5-min TTL) — autoDiscover runs on every proxy request,
+  // and an uncached fetch would hit api.anthropic.com once per request, hammering the
+  // active account's token (exactly the per-account load balance mode tries to avoid).
   const token = creds.claudeAiOauth.accessToken;
-  const email = await fetchAccountEmail(token);
+  const email = await getEmailForToken(token, fp);
 
   for (const file of files) {
     const savedName = basename(file, '.json');
@@ -933,6 +951,12 @@ async function handleAPI(req, res) {
     if (typeof patch.rotationStrategy === 'string' && ROTATION_STRATEGIES[patch.rotationStrategy]) {
       settings.rotationStrategy = patch.rotationStrategy;
       lastRotationTime = Date.now(); // reset timer on strategy change
+      // Balance mode supersedes the global serialize gate — disarm it so the two
+      // beta gates never both apply.
+      if (patch.rotationStrategy === 'balance' && settings.serializeRequests) {
+        settings.serializeRequests = false;
+        drainSerializationQueue();
+      }
     }
     if (typeof patch.rotationIntervalMin === 'number' && ROTATION_INTERVALS.includes(patch.rotationIntervalMin)) {
       settings.rotationIntervalMin = patch.rotationIntervalMin;
@@ -945,6 +969,12 @@ async function handleAPI(req, res) {
     }
     if (typeof patch.serializeDelayMs === 'number' && patch.serializeDelayMs >= 0 && patch.serializeDelayMs <= 2000) {
       settings.serializeDelayMs = patch.serializeDelayMs;
+    }
+    if (typeof patch.maxConcurrentPerAccount === 'number' && patch.maxConcurrentPerAccount >= 1 && patch.maxConcurrentPerAccount <= 50) {
+      settings.maxConcurrentPerAccount = Math.floor(patch.maxConcurrentPerAccount);
+    }
+    if (typeof patch.balanceWaitMs === 'number' && patch.balanceWaitMs >= 0 && patch.balanceWaitMs <= 30000) {
+      settings.balanceWaitMs = patch.balanceWaitMs;
     }
     if (typeof patch.commitTokenUsage === 'boolean') settings.commitTokenUsage = patch.commitTokenUsage;
     if (typeof patch.sessionMonitor === 'boolean') settings.sessionMonitor = patch.sessionMonitor;
@@ -2452,6 +2482,7 @@ function renderHTML() {
             <option value="round-robin">Round-robin</option>
             <option value="spread">Spread</option>
             <option value="drain-first">Drain first</option>
+            <option value="balance">Balance</option>
           </select>
         </div>
         <div class="config-row" id="interval-ctrl" style="display:none">
@@ -2464,6 +2495,20 @@ function renderHTML() {
             <option value="30">30 min</option>
             <option value="60">1 hr</option>
             <option value="120">2 hr</option>
+          </select>
+        </div>
+        <div class="config-row" id="max-concurrent-ctrl" style="display:none">
+          <div class="config-info">
+            <div class="config-label">Max concurrent per account</div>
+            <div class="config-desc">In-flight requests allowed per account before spilling to the next</div>
+          </div>
+          <select class="config-select" id="sel-max-concurrent" onchange="changeMaxConcurrent(Number(this.value))">
+            <option value="2">2</option>
+            <option value="4">4</option>
+            <option value="6">6</option>
+            <option value="8">8</option>
+            <option value="12">12</option>
+            <option value="16">16</option>
           </select>
         </div>
         <div id="strategy-list" class="strategy-list"></div>
@@ -2830,14 +2875,18 @@ async function refresh() {
     }
     document.getElementById('account-count').textContent = profiles.length;
     if (rotationStrategy) {
-      const strategyNames = { sticky: 'Sticky', conserve: 'Conserve', 'round-robin': 'Round-robin', spread: 'Spread', 'drain-first': 'Drain first' };
+      const strategyNames = { sticky: 'Sticky', conserve: 'Conserve', 'round-robin': 'Round-robin', spread: 'Spread', 'drain-first': 'Drain first', balance: 'Balance' };
       document.getElementById('current-strategy').textContent = ' \\u00b7 ' + (strategyNames[rotationStrategy] || rotationStrategy);
     }
     if (probeStats) renderProbeStats(probeStats);
     // [BETA] Queue stats
     if (queueStats) {
       var qEl = document.getElementById('queue-stats');
-      if (queueStats.inflight > 0 || queueStats.queued > 0) {
+      if (queueStats.balanceMode && (queueStats.balanceInflight > 0 || queueStats.balanceWaiting > 0)) {
+        qEl.style.display = '';
+        qEl.textContent = 'Balance: ' + queueStats.balanceInflight + ' in-flight'
+          + (queueStats.balanceWaiting > 0 ? ', ' + queueStats.balanceWaiting + ' waiting for a slot' : '');
+      } else if (!queueStats.balanceMode && (queueStats.inflight > 0 || queueStats.queued > 0)) {
         qEl.style.display = '';
         qEl.textContent = 'Queue: ' + queueStats.inflight + ' inflight, ' + queueStats.queued + ' queued';
       } else {
@@ -3072,6 +3121,7 @@ const STRATEGY_HINTS = {
   'round-robin': 'Rotates to the least-used account on a timer. Good balance of safety and efficiency.',
   spread: 'Picks the least-used account on every request. Switches often  - may trigger Anthropic notices.',
   'drain-first': 'Uses the account with highest 5hr utilization first. Good for short sessions.',
+  balance: 'Spreads concurrent requests across accounts, capped per account. Best for running many sessions at once  - avoids per-account rate limits.',
 };
 
 async function loadSettingsUI() {
@@ -3082,6 +3132,7 @@ async function loadSettingsUI() {
     document.getElementById('toggle-notifs').checked = s.notifications !== false;
     document.getElementById('sel-strategy').value = s.rotationStrategy || 'conserve';
     document.getElementById('sel-interval').value = s.rotationIntervalMin || 60;
+    document.getElementById('sel-max-concurrent').value = s.maxConcurrentPerAccount || 8;
     updateStrategyUI(s.rotationStrategy || 'conserve');
     // [BETA] Serialization
     document.getElementById('toggle-serialize').checked = !!s.serializeRequests;
@@ -3100,10 +3151,12 @@ const STRATEGY_DETAILS = {
   'round-robin': { name: 'Round-robin', desc: 'Rotate to the least-used account on a fixed timer. Balances load evenly while limiting switch frequency.' },
   spread:        { name: 'Spread',      desc: 'Always pick the account with the lowest 5hr utilization on every request. Switches often  - best for short, bursty sessions.' },
   'drain-first': { name: 'Drain first', desc: 'Use the account with the highest 5hr utilization first, draining it before moving on. Good for finishing off nearly-exhausted windows.' },
+  balance:       { name: 'Balance',     desc: 'Spread concurrent requests across accounts by least in-flight count, capped per account. When all accounts hit the cap it briefly waits for a free slot, then overflows rather than dropping. Best when running many sessions/subagents at once  - divides per-minute load so no single account gets throttled.' },
 };
 
 function updateStrategyUI(strategy) {
   document.getElementById('interval-ctrl').style.display = strategy === 'round-robin' ? '' : 'none';
+  document.getElementById('max-concurrent-ctrl').style.display = strategy === 'balance' ? '' : 'none';
   document.getElementById('strategy-hint').textContent = STRATEGY_HINTS[strategy] || '';
   const list = document.getElementById('strategy-list');
   list.innerHTML = Object.entries(STRATEGY_DETAILS).map(([key, s]) =>
@@ -3155,7 +3208,23 @@ async function changeStrategy(value) {
       body: JSON.stringify({ rotationStrategy: value })
     });
     updateStrategyUI(value);
+    // Balance mode supersedes serialize — reflect the server-side auto-disable in the UI.
+    if (value === 'balance') {
+      document.getElementById('toggle-serialize').checked = false;
+      document.getElementById('serialize-delay-ctrl').style.display = 'none';
+    }
     showToast('Rotation: ' + (document.getElementById('sel-strategy').selectedOptions[0]?.text || value));
+  } catch { showToast('Failed to update'); }
+}
+
+async function changeMaxConcurrent(value) {
+  try {
+    await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ maxConcurrentPerAccount: value })
+    });
+    showToast('Max concurrent per account: ' + value);
   } catch { showToast('Failed to update'); }
 }
 
@@ -4950,7 +5019,13 @@ let _inflightCount = 0;
 const _requestQueue = [];
 
 function getQueueStats() {
-  return { inflight: _inflightCount, queued: _requestQueue.length };
+  return {
+    inflight: _inflightCount,
+    queued: _requestQueue.length,
+    balanceMode: isBalanceMode(),
+    balanceInflight: balanceLimiter.total(),
+    balanceWaiting: balanceLimiter.waitingCount(),
+  };
 }
 
 function drainSerializationQueue() {
@@ -4961,8 +5036,9 @@ function drainSerializationQueue() {
 }
 
 function withSerializationQueue(fn, isRetry = false) {
+  // Balance mode gates per-account (inside handleProxyRequest), never globally → run immediately.
   // If serialization disabled, retries, or nothing inflight → run immediately
-  if (!settings.serializeRequests || isRetry || _inflightCount === 0) {
+  if (isBalanceMode() || !settings.serializeRequests || isRetry || _inflightCount === 0) {
     _inflightCount++;
     return fn().finally(() => {
       _inflightCount--;
@@ -5009,6 +5085,85 @@ function _dispatchNext() {
     const next = _requestQueue.shift();
     next.resolve();
   }
+}
+
+// ─────────────────────────────────────────────────
+// Per-account concurrency load-balancing (`balance` mode)
+// ─────────────────────────────────────────────────
+
+const BALANCE_MIN_COOLDOWN_SEC = 3;              // floor for transient-429 cooldown in balance mode
+const balanceLimiter = createBalanceLimiter();   // in-flight tracker + wait/overflow queue
+const _balanceCooldown = new Map();              // accountName -> cooldownUntil (ms); transient-429 backoff
+
+function isBalanceMode() {
+  return settings.rotationStrategy === 'balance';
+}
+
+// Briefly sideline an account after a transient 429 WITHOUT polluting the global
+// rate-limit (`limited`) state — purely a load-balancing backoff. Keyed by name.
+function balanceCoolDown(name, seconds) {
+  if (name) _balanceCooldown.set(name, Date.now() + seconds * 1000);
+}
+
+// Tokens of accounts currently in balance cooldown (so pickLeastLoaded skips them).
+// Prunes ALL expired entries first — including those for accounts that have since
+// been removed — so the map can't grow unbounded under account churn.
+function _balanceCooledTokens(allAccounts, now = Date.now()) {
+  if (_balanceCooldown.size === 0) return null;
+  for (const [name, until] of _balanceCooldown) {
+    if (until <= now) _balanceCooldown.delete(name);
+  }
+  if (_balanceCooldown.size === 0) return null;
+  const cooled = new Set();
+  for (const a of allAccounts) {
+    if (_balanceCooldown.has(a.name)) cooled.add(a.token);
+  }
+  return cooled.size ? cooled : null;
+}
+
+/**
+ * Acquire a per-account concurrency slot for balance mode.
+ *
+ * Picks the least-loaded available account; if it's under the cap, acquires and
+ * returns immediately. If every available account is at the cap, waits up to
+ * `balanceWaitMs` for a freed slot, then OVERFLOWS onto the least-loaded account
+ * rather than ever dropping the request. Returns the chosen account with the slot
+ * already acquired, or null when no account is available at all (genuine exhaustion).
+ *
+ * The wait/overflow/wakeup mechanics live in `balanceLimiter` (createBalanceLimiter,
+ * unit-tested in lib.mjs). Here we only supply the live candidate picker.
+ */
+async function acquireBalanceSlot(allAccounts, excludeTokens = new Set()) {
+  const cap = settings.maxConcurrentPerAccount || 8;
+  const waitMs = settings.balanceWaitMs ?? 10_000;
+  // Merge in accounts that are in transient-429 cooldown so they're skipped too.
+  const withCooldown = () => {
+    const cooled = _balanceCooledTokens(allAccounts);
+    if (!cooled) return excludeTokens;
+    const merged = new Set(excludeTokens);
+    for (const t of cooled) merged.add(t);
+    return merged;
+  };
+  // Single account: capping/waiting can't spread load anywhere, so never block —
+  // acquire immediately (best effort) if it's available, else report exhausted.
+  if (allAccounts.length <= 1) {
+    const excl = withCooldown();
+    const only = allAccounts.find(a => !excl.has(a.token) && isAccountAvailable(a.token, a.expiresAt));
+    if (!only) return null;
+    balanceLimiter.inflight.acquire(only.name);
+    return { account: only, overflow: false };
+  }
+  const result = await balanceLimiter.acquire(() => {
+    const pick = _pickLeastLoaded(allAccounts, balanceLimiter.inflight, accountState, cap, withCooldown());
+    return pick ? { key: pick.account.name, inflight: pick.inflight, account: pick.account } : null;
+  }, { cap, waitMs });
+  if (!result) return null;                        // no available account → caller runs exhausted path
+  if (result.overflow) {
+    const nm = result.account.label || result.account.name;
+    logEvent('balance-overflow', { account: nm, cap });
+    log('balance', `all accounts at cap (${cap}) — overflow onto ${nm}`);
+  }
+  return { account: result.account, overflow: result.overflow };
 }
 
 // ─────────────────────────────────────────────────
@@ -5909,11 +6064,53 @@ async function handleProxyRequest(clientReq, clientRes) {
   let _bulkRefreshAttempted = false;   // per-request: tried force-refreshing all tokens?
   let _minimalHeaderRetried = false;   // per-request: tried minimal-header last resort?
 
+  // ── Balance-mode concurrency slot ──
+  // heldKey = the account name whose in-flight slot we currently hold (null = none).
+  // releaseHeld is idempotent and a no-op outside balance mode. Attaching it to the
+  // response 'close' event guarantees the slot is released exactly once when the
+  // response completes OR the connection is terminated — covering every return/throw
+  // path below (streaming end, switch, passthrough, deadline, exhaustion).
+  const balanceMode = isBalanceMode();
+  let heldKey = null;
+  let clientGone = false;
+  const releaseHeld = () => {
+    if (heldKey != null) { balanceLimiter.release(heldKey); heldKey = null; }
+  };
+  // Releasing on response 'close' covers normal completion AND abnormal termination.
+  // The clientGone flag also catches a disconnect that lands *during* a slot wait — a
+  // slot acquired after the (already-fired, once-only) close listener would otherwise leak.
+  clientRes.once('close', () => { clientGone = true; releaseHeld(); });
+  // Switch accounts in balance mode: release the current slot, then acquire one on a
+  // different (untried) account. Returns the new account, or null when exhausted/aborted.
+  const balanceSwitch = async (excludeTokens) => {
+    releaseHeld();
+    // Reload fresh (mirrors pickBestAccount) so post-refresh tokens/expiry are current.
+    const slot = await acquireBalanceSlot(loadAllAccountTokens(), excludeTokens);
+    if (!slot) return null;
+    heldKey = slot.account.name;
+    if (clientGone) { releaseHeld(); return null; } // client left during the wait — don't leak
+    return slot.account;
+  };
+
   // Start with active keychain token, apply rotation strategy
   let token = getActiveToken();
   const activeAcct = allAccounts.find(a => a.token === token);
 
-  if (settings.autoSwitch) {
+  if (balanceMode) {
+    // Spread load across accounts by least in-flight count; no keychain write
+    // (the active pointer stays stable). If no account is available, fall through
+    // with the keychain token — the retry loop's exhausted path handles it.
+    const slot = await acquireBalanceSlot(allAccounts, new Set());
+    if (slot) {
+      token = slot.account.token;
+      heldKey = slot.account.name;
+      if (clientGone) releaseHeld(); // client left during the wait — release the slot
+      const nm = slot.account.label || slot.account.name;
+      if (!activeAcct || slot.account.name !== activeAcct.name) {
+        log('balance', `→ ${nm} (${balanceLimiter.get(slot.account.name)}/${settings.maxConcurrentPerAccount || 8} in-flight)`);
+      }
+    }
+  } else if (settings.autoSwitch) {
     const { account: strategyPick, rotated } = _pickByStrategy({
       strategy: settings.rotationStrategy || 'conserve',
       intervalMin: settings.rotationIntervalMin || 60,
@@ -5986,12 +6183,17 @@ async function handleProxyRequest(clientReq, clientRes) {
           const refreshed = loadAllAccountTokens().find(a => a.name === preAcct.name);
           if (refreshed) {
             token = refreshed.token;
-            try {
-              await withSwitchLock(() => {
-                writeKeychain(refreshed.creds);
-                invalidateTokenCache();
-              });
-            } catch {}
+            // In balance mode, don't clobber the keychain active pointer — forward
+            // the refreshed token in-memory (heldKey is the stable account name, so
+            // the held slot is unaffected by the token change).
+            if (!balanceMode) {
+              try {
+                await withSwitchLock(() => {
+                  writeKeychain(refreshed.creds);
+                  invalidateTokenCache();
+                });
+              } catch {}
+            }
             log('refresh-preflight', `${preAcctName}: refreshed OK, proceeding with new token`);
           }
         } else {
@@ -6054,17 +6256,21 @@ async function handleProxyRequest(clientReq, clientRes) {
 
     // Network failure after retry  - try switching to another account before giving up
     if (lastNetworkError) {
-      if (settings.autoSwitch) {
-        const next = pickBestAccount(triedTokens) || pickAnyUntried(triedTokens);
+      if (settings.autoSwitch || balanceMode) {
+        const next = balanceMode
+          ? await balanceSwitch(triedTokens)
+          : (pickBestAccount(triedTokens) || pickAnyUntried(triedTokens));
         if (next) {
-          log('switch', `  → network error on ${acctName}, switching to ${next.label || next.name}`);
-          try {
-            await withSwitchLock(() => {
-              writeKeychain(next.creds);
-              invalidateTokenCache();
-            });
-          } catch (e) {
-            log('warn', `Keychain write failed during network-error switch: ${e.message}`);
+          log(balanceMode ? 'balance' : 'switch', `  → network error on ${acctName}, switching to ${next.label || next.name}`);
+          if (!balanceMode) {
+            try {
+              await withSwitchLock(() => {
+                writeKeychain(next.creds);
+                invalidateTokenCache();
+              });
+            } catch (e) {
+              log('warn', `Keychain write failed during network-error switch: ${e.message}`);
+            }
           }
           token = next.token;
           logEvent('auto-switch', { from: acctName, to: next.label || next.name, reason: 'network-error' });
@@ -6083,6 +6289,56 @@ async function handleProxyRequest(clientReq, clientRes) {
     // ── 429: Rate limited → auto-switch (if enabled) ──
     if (status === 429) {
       const retryAfter = parseInt(proxyRes.headers['retry-after'] || '0', 10);
+
+      // ── Balance mode: absorb the 429 instead of surfacing it ──
+      // This is the "Server is temporarily limiting requests" error. Sideline this
+      // account briefly and retry on another, so the client rarely sees the 429.
+      if (balanceMode) {
+        const coolName = heldKey || acct?.name;
+        const transient = retryAfter < 60;
+        if (transient) {
+          // Transient burst — lightweight backoff, no global rate-limit state pollution.
+          balanceCoolDown(coolName, Math.max(retryAfter, BALANCE_MIN_COOLDOWN_SEC));
+          logEvent('balance-cooldown', { account: acctName, retryAfter });
+          log('balance', `${acctName} → 429 transient (retry-after ${retryAfter}s) — backing off, switching account`);
+        } else {
+          // Genuine rate limit — mark limited so the UI/telemetry reflect it.
+          markAccountLimited(token, acctName, retryAfter);
+          logEvent('rate-limited', { account: acctName, retryAfter });
+          log('balance', `${acctName} → 429 rate limited (retry-after ${retryAfter}s) — switching account`);
+        }
+        // Capture the upstream 429 before draining so we can replay it verbatim if
+        // no other account is free (preserves retry-after for Claude Code's own retry).
+        const upStatus = proxyRes.statusCode;
+        const upHeaders = { ...proxyRes.headers };
+        const upBody = await drainResponse(proxyRes);
+        const next = await balanceSwitch(triedTokens);
+        if (next) {
+          token = next.token;
+          continue;
+        }
+        if (transient) {
+          // All accounts in a transient burst → DON'T manufacture a hard error.
+          // Pass the original 429 (with its retry-after) straight through; Claude
+          // Code retries on its own — strictly better than a synthesized exhaustion.
+          log('balance', '  → all accounts cooling (transient) — passing upstream 429 through');
+          delete upHeaders['content-length'];
+          delete upHeaders['transfer-encoding'];
+          clientRes.writeHead(upStatus, upHeaders);
+          clientRes.end(upBody);
+          return;
+        }
+        // Genuine rate limit across all accounts — surface the exhaustion.
+        log('balance', '  → all accounts rate limited, returning 429');
+        logEvent('all-exhausted', {});
+        notify('All Accounts Exhausted', `All ${allAccounts.length} accounts rate-limited. Reset: ${getEarliestReset()}`);
+        clientRes.writeHead(429, { 'Content-Type': 'application/json' });
+        clientRes.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'rate_limit_error', message: `All ${allAccounts.length} accounts rate limited. Earliest reset: ${getEarliestReset()}` },
+        }));
+        return;
+      }
 
       // Transient burst 429s (short retry-after) are normal — Claude Code
       // retries on its own.  Pass through silently without noisy logging,
@@ -6175,7 +6431,7 @@ async function handleProxyRequest(clientReq, clientRes) {
       markAccountExpired(token, acctName);
       logEvent('auth-expired', { account: acctName });
 
-      if (!settings.autoSwitch) {
+      if (!settings.autoSwitch && !balanceMode) {
         log('switch', '  → auto-switch OFF — trying passthrough');
         if (await _passthroughFallback(clientReq, clientRes, body, '401-autoswitch-off')) return;
         clientRes.writeHead(401, { 'Content-Type': 'application/json' });
@@ -6186,16 +6442,20 @@ async function handleProxyRequest(clientReq, clientRes) {
         return;
       }
 
-      const next = pickBestAccount(triedTokens) || pickAnyUntried(triedTokens);
+      const next = balanceMode
+        ? await balanceSwitch(triedTokens)
+        : (pickBestAccount(triedTokens) || pickAnyUntried(triedTokens));
       if (next) {
-        log('switch', `  → switching to ${next.label || next.name}`);
-        try {
-          await withSwitchLock(() => {
-            writeKeychain(next.creds);
-            invalidateTokenCache();
-          });
-        } catch (e) {
-          log('warn', `Keychain write failed during 401 switch: ${e.message}`);
+        log(balanceMode ? 'balance' : 'switch', `  → switching to ${next.label || next.name}`);
+        if (!balanceMode) {
+          try {
+            await withSwitchLock(() => {
+              writeKeychain(next.creds);
+              invalidateTokenCache();
+            });
+          } catch (e) {
+            log('warn', `Keychain write failed during 401 switch: ${e.message}`);
+          }
         }
         token = next.token;
         logEvent('auto-switch', { from: acctName, to: next.label || next.name, reason: '401' });
@@ -6361,17 +6621,21 @@ async function handleProxyRequest(clientReq, clientRes) {
       }
 
       // ── Strategy 3: Switch to another account ──
-      if (settings.autoSwitch) {
-        const next = pickBestAccount(triedTokens) || pickAnyUntried(triedTokens);
+      if (settings.autoSwitch || balanceMode) {
+        const next = balanceMode
+          ? await balanceSwitch(triedTokens)
+          : (pickBestAccount(triedTokens) || pickAnyUntried(triedTokens));
         if (next) {
-          log('switch', `  → 400 on ${acctName}, switching to ${next.label || next.name}`);
-          try {
-            await withSwitchLock(() => {
-              writeKeychain(next.creds);
-              invalidateTokenCache();
-            });
-          } catch (e) {
-            log('warn', `Keychain write failed during 400 switch: ${e.message}`);
+          log(balanceMode ? 'balance' : 'switch', `  → 400 on ${acctName}, switching to ${next.label || next.name}`);
+          if (!balanceMode) {
+            try {
+              await withSwitchLock(() => {
+                writeKeychain(next.creds);
+                invalidateTokenCache();
+              });
+            } catch (e) {
+              log('warn', `Keychain write failed during 400 switch: ${e.message}`);
+            }
           }
           token = next.token;
           logEvent('auto-switch', { from: acctName, to: next.label || next.name, reason: '400-error' });
@@ -6562,9 +6826,17 @@ function getProxyStatus() {
         name: a.name,
         label: a.label,
         available: isAccountAvailable(a.token, a.expiresAt),
+        inflight: balanceLimiter.get(a.name),
+        coolingDown: (_balanceCooldown.get(a.name) || 0) > Date.now(),
         ...(state || {}),
       };
     }),
+    balance: {
+      enabled: isBalanceMode(),
+      cap: settings.maxConcurrentPerAccount || 8,
+      totalInflight: balanceLimiter.total(),
+      waiting: balanceLimiter.waitingCount(),
+    },
     recentEvents: proxyEventLog.slice(0, 20),
   };
 }

@@ -268,6 +268,18 @@ with open('$CONFIG_FILE', 'w') as f:
 " 2>/dev/null
 }
 
+# Best-effort: push the just-written key to a running dashboard so the change
+# applies live (the dashboard otherwise only reads config.json at startup).
+# Reads the value back from config.json so JSON typing (bool/number/string) is correct.
+apply_setting_live() {
+  local key="$1"
+  local body
+  body=$(read_config | python3 -c "import sys,json; c=json.load(sys.stdin); print(json.dumps({'$key': c.get('$key')}))" 2>/dev/null) || return 0
+  [[ -z "$body" ]] && return 0
+  curl -s --max-time 2 -X POST "http://localhost:$DASHBOARD_PORT/api/settings" \
+    -H 'Content-Type: application/json' -d "$body" >/dev/null 2>&1 || true
+}
+
 # ─────────────────────────────────────────────────────────
 # Commands
 # ─────────────────────────────────────────────────────────
@@ -579,6 +591,28 @@ print(f'{sub}|{tier}|{exp_str}|{scopes}')
   if [[ "${strategy:-sticky}" == "round-robin" ]]; then
     echo -e "  Interval:      ${interval:-60} min"
   fi
+  if [[ "${strategy:-sticky}" == "balance" ]]; then
+    local cap=$(get_config_string "maxConcurrentPerAccount")
+    echo -e "  Max/account:   ${cap:-8} in-flight"
+    # Live in-flight spread from a running dashboard, if reachable
+    local pstatus
+    pstatus=$(curl -s --max-time 2 "http://localhost:$DASHBOARD_PORT/api/proxy-status" 2>/dev/null) || true
+    if [[ -n "$pstatus" ]]; then
+      echo "$pstatus" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+b = d.get('balance', {})
+total = b.get('totalInflight', 0); waiting = b.get('waiting', 0)
+print(f'  In-flight:     {total} total' + (f', {waiting} waiting for a slot' if waiting else ''))
+rows = [(a.get('label') or a.get('name'), a.get('inflight', 0)) for a in d.get('accounts', []) if a.get('inflight')]
+for name, n in sorted(rows, key=lambda r: -r[1]):
+    print(f'                 {name}: {n}')
+" 2>/dev/null || true
+    fi
+  fi
 
   # Version
   if [[ -f "$SCRIPT_DIR/.version" ]]; then
@@ -626,6 +660,12 @@ cmd_config() {
     fi
     local delay=$(get_config_string "serializeDelayMs")
     echo -e "  serializeDelayMs:   ${delay:-200}  ${DIM}[BETA]${NC}"
+    local maxconc=$(get_config_string "maxConcurrentPerAccount")
+    if [[ "$strategy" == "balance" ]]; then
+      echo -e "  maxConcurrentPerAccount: ${GREEN}${maxconc:-8}${NC}  ${DIM}[BETA] per-account in-flight cap${NC}"
+    else
+      echo -e "  maxConcurrentPerAccount: ${maxconc:-8}  ${DIM}[BETA] (only used by rotation=balance)${NC}"
+    fi
     local commit_tokens=$(get_config_value "commitTokenUsage")
     if [[ "$commit_tokens" == "True" ]]; then
       echo -e "  commitTokenUsage:   ${GREEN}on${NC}"
@@ -637,8 +677,9 @@ cmd_config() {
     echo -e "  ${DIM}  vdm config proxy on${NC}"
     echo -e "  ${DIM}  vdm config autoswitch off${NC}"
     echo -e "  ${DIM}  vdm config notifications off${NC}"
-    echo -e "  ${DIM}  vdm config rotation sticky|conserve|round-robin|spread|drain-first${NC}"
+    echo -e "  ${DIM}  vdm config rotation sticky|conserve|round-robin|spread|drain-first|balance${NC}"
     echo -e "  ${DIM}  vdm config interval 15|30|60|120${NC}"
+    echo -e "  ${DIM}  vdm config max-concurrent 1-50${NC}  ${DIM}[BETA] per-account cap for rotation=balance${NC}"
     echo -e "  ${DIM}  vdm config serialize on|off${NC}  ${DIM}[BETA]${NC}"
     echo -e "  ${DIM}  vdm config serialize-delay 0|100|200|500|1000${NC}  ${DIM}[BETA]${NC}"
     echo -e "  ${DIM}  vdm config commit-tokens on|off${NC}"
@@ -655,10 +696,11 @@ cmd_config() {
     interval|rotationIntervalMin)         key="rotationIntervalMin"; is_bool=false ;;
     serialize|serializeRequests|serialize-requests) key="serializeRequests" ;;
     serialize-delay|serializeDelayMs|serialize-delay-ms) key="serializeDelayMs"; is_bool=false ;;
+    max-concurrent|maxConcurrentPerAccount|max-concurrent-per-account) key="maxConcurrentPerAccount"; is_bool=false ;;
     commit-tokens|commitTokenUsage|commit-token-usage) key="commitTokenUsage" ;;
     *)
       echo -e "${RED}Unknown setting: $key${NC}"
-      echo "  Available: proxy, autoswitch, notifications, rotation, interval, serialize, serialize-delay, commit-tokens"
+      echo "  Available: proxy, autoswitch, notifications, rotation, interval, max-concurrent, serialize, serialize-delay, commit-tokens"
       return 1
       ;;
   esac
@@ -692,15 +734,19 @@ cmd_config() {
     fi
   elif [[ "$key" == "rotationStrategy" ]]; then
     case "$value" in
-      sticky|conserve|round-robin|spread|drain-first) ;;
+      sticky|conserve|round-robin|spread|drain-first|balance) ;;
       *)
         echo -e "${RED}Invalid strategy: $value${NC}"
-        echo "  Options: sticky, conserve, round-robin, spread, drain-first"
+        echo "  Options: sticky, conserve, round-robin, spread, drain-first, balance"
         return 1
         ;;
     esac
     set_config_string "$key" "$value"
     echo -e "${GREEN}✓${NC} ${BOLD}$key${NC} = ${CYAN}$value${NC}"
+    if [[ "$value" == "balance" ]]; then
+      local cap=$(get_config_string "maxConcurrentPerAccount")
+      echo -e "  ${DIM}Spreading load across accounts, max ${cap:-8} in-flight each. Tune: vdm config max-concurrent N${NC}"
+    fi
   elif [[ "$key" == "rotationIntervalMin" ]]; then
     case "$value" in
       15|30|60|120) ;;
@@ -721,7 +767,17 @@ cmd_config() {
     esac
     set_config_number "$key" "$value"
     echo -e "${GREEN}✓${NC} ${BOLD}$key${NC} = ${CYAN}${value} ms${NC}"
+  elif [[ "$key" == "maxConcurrentPerAccount" ]]; then
+    if ! [[ "$value" =~ ^[0-9]+$ ]] || (( value < 1 || value > 50 )); then
+      echo -e "${RED}Invalid value: $value${NC}  (use a number 1-50)"
+      return 1
+    fi
+    set_config_number "$key" "$value"
+    echo -e "${GREEN}✓${NC} ${BOLD}$key${NC} = ${CYAN}${value}${NC}  ${DIM}concurrent in-flight per account${NC}"
   fi
+
+  # Apply live to a running dashboard so the change takes effect without a restart.
+  apply_setting_live "$key"
 
   log_activity "settings-changed" "$key=$value"
 }

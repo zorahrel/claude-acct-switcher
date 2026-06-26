@@ -137,6 +137,123 @@ export function createAccountStateManager() {
 }
 
 // ─────────────────────────────────────────────────
+// In-flight request tracking (for `balance` load-balancing)
+// ─────────────────────────────────────────────────
+
+/**
+ * Tracks the number of concurrent in-flight requests per account.
+ *
+ * Keyed by account NAME (the credential file basename), NOT token/fingerprint:
+ * a token refresh changes the fingerprint but keeps the name stable, so an
+ * in-place refresh needs zero slot bookkeeping. `release` is underflow-guarded
+ * and double-release safe, so the caller's single finally-release can never
+ * drive a counter negative.
+ */
+export function createInflightTracker() {
+  const counts = new Map();
+
+  function acquire(name) {
+    const n = (counts.get(name) || 0) + 1;
+    counts.set(name, n);
+    return n;
+  }
+
+  function release(name) {
+    const n = counts.get(name) || 0;
+    if (n <= 1) counts.delete(name);
+    else counts.set(name, n - 1);
+    return Math.max(0, n - 1);
+  }
+
+  function get(name) {
+    return counts.get(name) || 0;
+  }
+
+  function total() {
+    let sum = 0;
+    for (const n of counts.values()) sum += n;
+    return sum;
+  }
+
+  function snapshot() {
+    return Object.fromEntries(counts);
+  }
+
+  return { acquire, release, get, total, snapshot };
+}
+
+/**
+ * Concurrency limiter for `balance` mode: wraps an in-flight tracker with a
+ * wait-for-slot queue and overflow-on-timeout, so the wait/overflow/wakeup
+ * mechanics are unit-testable independently of the proxy.
+ *
+ * Timers and the clock are injectable for deterministic tests.
+ *
+ * acquire(pick, { cap, waitMs }):
+ *   - pick() returns the currently-best candidate as `{ key, inflight, ...rest }`
+ *     or null. It is re-invoked on every loop turn (in-flight counts change while
+ *     waiting), so it must read live counts.
+ *   - If the best candidate is under `cap`, acquires its slot and returns
+ *     `{ ...candidate, overflow: false }`.
+ *   - If every candidate is at the cap, waits up to `waitMs` for a freed slot
+ *     (woken by release()), then OVERFLOWS onto the best candidate
+ *     (`overflow: true`) rather than dropping. Returns null only when pick()
+ *     returns null (genuine exhaustion).
+ *
+ * release(name) frees a slot and wakes the longest-waiting acquirer.
+ */
+export function createBalanceLimiter({ now = () => Date.now(), setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
+  const inflight = createInflightTracker();
+  const waiters = []; // [{ resolve, timer }] — FIFO
+
+  function wake() {
+    const w = waiters.shift();
+    if (w) { clearTimer(w.timer); w.resolve(); }
+  }
+
+  function release(name) {
+    inflight.release(name);
+    wake();
+  }
+
+  async function acquire(pick, { cap, waitMs }) {
+    const deadline = now() + waitMs;
+    for (;;) {
+      const best = pick();
+      if (!best) return null;
+      if (best.inflight < cap) {
+        inflight.acquire(best.key);
+        return { ...best, overflow: false };
+      }
+      const remaining = deadline - now();
+      if (remaining <= 0) {
+        inflight.acquire(best.key);
+        return { ...best, overflow: true };
+      }
+      await new Promise(resolve => {
+        const entry = { resolve, timer: null };
+        entry.timer = setTimer(() => {
+          const i = waiters.indexOf(entry);
+          if (i !== -1) waiters.splice(i, 1);
+          resolve();
+        }, Math.min(remaining, 1000));
+        waiters.push(entry);
+      });
+    }
+  }
+
+  return {
+    inflight,
+    acquire,
+    release,
+    get: (name) => inflight.get(name),
+    total: () => inflight.total(),
+    snapshot: () => inflight.snapshot(),
+    waitingCount: () => waiters.length,
+  };
+}
+
+// ─────────────────────────────────────────────────
 // Account availability & selection
 // ─────────────────────────────────────────────────
 
@@ -207,6 +324,38 @@ export function pickAnyUntried(accounts, excludeTokens) {
   return accounts.find(a => !excludeTokens.has(a.token)) || null;
 }
 
+/**
+ * Pick the least-loaded available account for concurrency load-balancing (`balance` mode).
+ *
+ * Among accounts that are available (not limited/expired/cooling-down) and not excluded,
+ * returns the one with the lowest in-flight request count, tie-broken by 5h utilization
+ * (prefer the less-used window). The returned `overCap` flag is true when even the
+ * least-loaded account is already at or above `cap` — the caller decides whether to wait
+ * for a slot or overflow.
+ *
+ * @param {Array}  accounts        - account objects { name, token, expiresAt, ... }
+ * @param {object} inflightTracker - createInflightTracker() instance (keyed by account name)
+ * @param {object} stateManager    - account state manager
+ * @param {number} cap             - max concurrent in-flight per account
+ * @param {Set}    excludeTokens   - tokens to skip (already tried this request)
+ * @param {number} [now]           - current time (for testing cooldown windows)
+ * @returns {{ account: object, inflight: number, overCap: boolean } | null}
+ */
+export function pickLeastLoaded(accounts, inflightTracker, stateManager, cap, excludeTokens = new Set(), now = Date.now()) {
+  const candidates = accounts
+    .filter(a => !excludeTokens.has(a.token) && isAccountAvailable(a.token, a.expiresAt, stateManager, now))
+    .map(a => ({
+      account: a,
+      inflight: inflightTracker.get(a.name),
+      score: scoreAccount(a.token, stateManager),
+    }))
+    .sort((x, y) => (x.inflight - y.inflight) || (x.score - y.score));
+
+  const best = candidates[0];
+  if (!best) return null;
+  return { account: best.account, inflight: best.inflight, overCap: best.inflight >= cap };
+}
+
 // ─────────────────────────────────────────────────
 // Rotation strategies
 // ─────────────────────────────────────────────────
@@ -217,6 +366,7 @@ export const ROTATION_STRATEGIES = {
   'round-robin': { label: 'Round-robin',   desc: 'Rotate to lowest-utilization account on a timer' },
   spread:        { label: 'Spread',        desc: 'Always pick lowest utilization (switches often)' },
   'drain-first': { label: 'Drain first',   desc: 'Use highest 5hr-utilization account first' },
+  balance:       { label: 'Balance',       desc: 'Spread concurrent requests across accounts, capped per account' },
 };
 
 export const ROTATION_INTERVALS = [15, 30, 60, 120]; // minutes
