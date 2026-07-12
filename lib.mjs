@@ -325,6 +325,42 @@ export function pickAnyUntried(accounts, excludeTokens) {
 }
 
 /**
+ * Priority of an account for the `priority` (failover) strategy.
+ * Higher number = more preferred. Unset / non-numeric defaults to 0.
+ */
+export function accountPriority(account) {
+  const p = account?.priority;
+  return Number.isFinite(p) ? p : 0;
+}
+
+/**
+ * Pick the highest-priority available account (`priority` / failover strategy).
+ *
+ * Among available (not limited/expired/cooling-down), non-excluded accounts,
+ * returns the one with the highest `priority`, tie-broken by lowest 5h
+ * utilization and then account name (for deterministic ordering). Because it
+ * always returns the globally most-preferred available account, a higher-priority
+ * account that comes back online is picked up automatically on the next request.
+ * Returns null when no account is available.
+ *
+ * @param {Array}  accounts      - account objects { name, token, expiresAt, priority? }
+ * @param {object} stateManager  - account state manager
+ * @param {Set}    excludeTokens - tokens to skip (already tried this request)
+ * @param {number} [now]         - current time (for testing cooldown windows)
+ */
+export function pickByPriority(accounts, stateManager, excludeTokens = new Set(), now = Date.now()) {
+  const candidates = accounts
+    .filter(a => !excludeTokens.has(a.token) && isAccountAvailable(a.token, a.expiresAt, stateManager, now))
+    .map(a => ({ ...a, prio: accountPriority(a), score: scoreAccount(a.token, stateManager) }))
+    .sort((a, b) =>
+      (b.prio - a.prio) ||           // higher priority first
+      (a.score - b.score) ||         // then lowest 5h utilization
+      (a.name < b.name ? -1 : a.name > b.name ? 1 : 0) // then name, for determinism
+    );
+  return candidates[0] || null;
+}
+
+/**
  * Pick the least-loaded available account for concurrency load-balancing (`balance` mode).
  *
  * Among accounts that are available (not limited/expired/cooling-down) and not excluded,
@@ -367,6 +403,7 @@ export const ROTATION_STRATEGIES = {
   spread:        { label: 'Spread',        desc: 'Always pick lowest utilization (switches often)' },
   'drain-first': { label: 'Drain first',   desc: 'Use highest 5hr-utilization account first' },
   balance:       { label: 'Balance',       desc: 'Spread concurrent requests across accounts, capped per account' },
+  priority:      { label: 'Priority',      desc: 'Prefer your highest-priority account; fail over on limit, switch back when it recovers' },
 };
 
 export const ROTATION_INTERVALS = [15, 30, 60, 120]; // minutes
@@ -376,7 +413,7 @@ export const ROTATION_INTERVALS = [15, 30, 60, 120]; // minutes
  * Returns null if the current account should be kept (sticky / timer not elapsed).
  *
  * @param {object} opts
- * @param {string} opts.strategy - 'sticky' | 'conserve' | 'round-robin' | 'spread' | 'drain-first'
+ * @param {string} opts.strategy - 'sticky' | 'conserve' | 'round-robin' | 'spread' | 'drain-first' | 'priority'
  * @param {number} opts.intervalMin - rotation interval in minutes (for round-robin)
  * @param {string|null} opts.currentToken - token currently in the keychain
  * @param {number} opts.lastRotationTime - timestamp of last proactive rotation
@@ -399,8 +436,11 @@ export function pickByStrategy(opts) {
     isAccountAvailable(currentToken, currentAcct.expiresAt, stateManager, now);
 
   if (!currentAvailable) {
-    // Must switch  - pick lowest utilization as safe default
-    const best = pickBestAccount(accounts, stateManager, excludeTokens);
+    // Must switch  - pick a replacement. Honor the priority ordering when that
+    // strategy is active, otherwise fall back to lowest utilization as a safe default.
+    const best = strategy === 'priority'
+      ? pickByPriority(accounts, stateManager, excludeTokens, now)
+      : pickBestAccount(accounts, stateManager, excludeTokens);
     return { account: best, rotated: !!best };
   }
 
@@ -444,6 +484,16 @@ export function pickByStrategy(opts) {
       const drain = pickDrainFirst(accounts, stateManager, excludeTokens);
       if (drain && drain.token !== currentToken) {
         return { account: drain, rotated: true };
+      }
+      return { account: null, rotated: false };
+    }
+
+    case 'priority': {
+      // Always run on the highest-priority available account. When the current
+      // account is available but a more-preferred one has recovered, switch up.
+      const preferred = pickByPriority(accounts, stateManager, excludeTokens, now);
+      if (preferred && preferred.token !== currentToken) {
+        return { account: preferred, rotated: true };
       }
       return { account: null, rotated: false };
     }

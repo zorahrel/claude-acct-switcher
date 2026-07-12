@@ -357,6 +357,48 @@ cmd_label() {
   log_activity "account-renamed" "name=$name" "label=$label"
 }
 
+cmd_priority() {
+  local name="${1:-}"
+  local priority="${2:-}"
+  if [[ -z "$name" || -z "$priority" ]]; then
+    echo -e "${RED}Usage: vdm priority <name> <n>${NC}"
+    echo "  Sets an account's priority for the 'priority' rotation strategy."
+    echo "  Higher number = preferred first; 0 (default) clears it."
+    echo "  Example: vdm priority work-account 10"
+    return 1
+  fi
+
+  name=$(echo "$name" | tr ' ' '-' | tr '[:upper:]' '[:lower:]')
+  if [[ ! "$priority" =~ ^-?[0-9]+$ ]]; then
+    echo -e "${RED}Priority must be an integer (e.g. 10, 0, -1).${NC}"
+    return 1
+  fi
+  local file="$ACCOUNTS_DIR/${name}.json"
+  if [[ ! -f "$file" ]]; then
+    echo -e "${RED}Profile '$name' not found.${NC}"
+    return 1
+  fi
+
+  # Prefer the dashboard API (writes the sidecar AND invalidates the account
+  # cache so the change takes effect immediately); fall back to a direct write.
+  local resp=""
+  if curl -s --max-time 2 "http://localhost:$DASHBOARD_PORT/health" >/dev/null 2>&1; then
+    resp=$(curl -s --max-time 2 -X POST "http://localhost:$DASHBOARD_PORT/api/priority" \
+      -H "Content-Type: application/json" \
+      -d "{\"name\":\"$name\",\"priority\":$priority}" 2>/dev/null) || true
+  fi
+  if [[ -z "$resp" ]]; then
+    # Dashboard not running — write the sidecar directly.
+    if [[ "$priority" == "0" ]]; then
+      rm -f "$ACCOUNTS_DIR/${name}.priority"
+    else
+      echo "$priority" > "$ACCOUNTS_DIR/${name}.priority"
+    fi
+  fi
+
+  echo -e "${GREEN}✓${NC} Set priority of ${BOLD}$name${NC} to ${CYAN}$priority${NC}"
+}
+
 cmd_list() {
   local active_fp
   active_fp=$(get_active_fingerprint 2>/dev/null) || active_fp=""
@@ -381,6 +423,9 @@ cmd_list() {
     local label_file="$ACCOUNTS_DIR/${name}.label"
     local label=""
     [[ -f "$label_file" ]] && label=$(cat "$label_file")
+    local priority_file="$ACCOUNTS_DIR/${name}.priority"
+    local priority=""
+    [[ -f "$priority_file" ]] && priority=$(cat "$priority_file")
 
     if [[ "$fp" == "$active_fp" ]]; then
       echo -e "  ${GREEN}▸ ${BOLD}$name${NC}  $(format_sub_type "$sub_type")  ${GREEN}← active${NC}"
@@ -391,6 +436,9 @@ cmd_list() {
       echo -e "      ${DIM}$label${NC}"
     fi
     echo -e "      ${DIM}tier: $tier  expires: $expires${NC}"
+    if [[ -n "$priority" && "$priority" != "0" ]]; then
+      echo -e "      ${DIM}priority: $priority${NC}"
+    fi
   done
 
   echo ""
@@ -1178,6 +1226,7 @@ cmd_help() {
   echo -e "    ${CYAN}list${NC}                    List all saved profiles"
   echo -e "    ${CYAN}switch${NC} [name]           Switch to a profile (interactive if no name)"
   echo -e "    ${CYAN}remove${NC} <name>           Delete a saved profile"
+  echo -e "    ${CYAN}priority${NC} <name> <n>      Set account priority (higher = preferred; 'priority' strategy)"
   echo -e "    ${CYAN}status${NC}                  Show current account details + settings"
   echo -e "    ${CYAN}config${NC} [key] [on|off]   View or toggle settings (proxy, autoswitch)"
   echo -e "    ${CYAN}dashboard${NC} [start|stop]  Launch/stop the web dashboard"
@@ -1214,6 +1263,7 @@ shift 2>/dev/null || true
 case "$command" in
   add)       cmd_add "$@" ;;
   label)     cmd_label "$@" ;;
+  priority|prio) cmd_priority "$@" ;;
   list|ls)   cmd_list ;;
   switch|sw) cmd_switch "$@" ;;
   remove|rm) cmd_remove "$@" ;;

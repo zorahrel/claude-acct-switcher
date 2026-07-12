@@ -733,6 +733,7 @@ async function loadProfiles() {
         dormant,
         expired: proxyExpired,
         refreshFailed: refreshFailures.get(name) || null,
+        priority: readAccountPriority(name),
       });
     } catch {
       // skip corrupt files
@@ -759,6 +760,7 @@ async function loadProfiles() {
       try {
         unlinkSync(join(ACCOUNTS_DIR, `${loser.name}.json`));
         try { unlinkSync(join(ACCOUNTS_DIR, `${loser.name}.label`)); } catch {}
+        try { unlinkSync(join(ACCOUNTS_DIR, `${loser.name}.priority`)); } catch {}
         log('dedup', `Removed duplicate account "${loser.name}" (same email as "${keepNew ? p.name : prevP.name}")`);
       } catch (e) {
         log('warn', `Failed to remove duplicate account file "${loser.name}": ${e.message}`);
@@ -874,9 +876,37 @@ async function handleAPI(req, res) {
       // Delete account files
       await unlink(file);
       try { await unlink(join(ACCOUNTS_DIR, `${name}.label`)); } catch {}
+      try { await unlink(join(ACCOUNTS_DIR, `${name}.priority`)); } catch {}
       logActivity('account-removed', { name });
       if (typeof invalidateAccountsCache === 'function') invalidateAccountsCache();
       json(res, { ok: true });
+    } catch (e) {
+      json(res, { ok: false, error: e.message }, 400);
+    }
+    return true;
+  }
+
+  if (url.pathname === '/api/priority' && req.method === 'POST') {
+    const body = await readBody(req);
+    const { name, priority } = JSON.parse(body);
+    if (!name) {
+      json(res, { ok: false, error: 'name required' }, 400);
+      return true;
+    }
+    if (!existsSync(join(ACCOUNTS_DIR, `${name}.json`))) {
+      json(res, { ok: false, error: `Unknown account "${name}"` }, 404);
+      return true;
+    }
+    const n = parseInt(priority, 10);
+    if (!Number.isFinite(n)) {
+      json(res, { ok: false, error: 'priority must be an integer' }, 400);
+      return true;
+    }
+    try {
+      const saved = writeAccountPriority(name, n);
+      invalidateAccountsCache();
+      logActivity('priority-set', { name, priority: saved });
+      json(res, { ok: true, name, priority: saved });
     } catch (e) {
       json(res, { ok: false, error: e.message }, 400);
     }
@@ -1581,6 +1611,45 @@ function renderHTML() {
   }
   .switch-btn:active { transform: scale(0.98); }
 
+  .card-priority {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.75rem;
+  }
+  .prio-cap {
+    font-size: 0.75rem;
+    font-weight: 500;
+    color: var(--muted-foreground);
+    letter-spacing: 0.02em;
+  }
+  .prio-btn {
+    width: 1.375rem;
+    height: 1.375rem;
+    line-height: 1;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--foreground);
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+    font-family: inherit;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+  }
+  .prio-btn:hover { background: var(--muted); }
+  .prio-val {
+    min-width: 1.25rem;
+    text-align: center;
+    font-size: 0.8125rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--foreground);
+  }
   .remove-btn {
     padding: 0.375rem 0.75rem;
     border-radius: var(--radius-sm);
@@ -2483,6 +2552,7 @@ function renderHTML() {
             <option value="spread">Spread</option>
             <option value="drain-first">Drain first</option>
             <option value="balance">Balance</option>
+            <option value="priority">Priority</option>
           </select>
         </div>
         <div class="config-row" id="interval-ctrl" style="display:none">
@@ -2708,6 +2778,28 @@ async function doRemove(name, e) {
   } catch(e) { showToast('Failed to remove'); }
 }
 
+async function bumpPriority(name, delta, e) {
+  if (e) e.stopPropagation();
+  const card = e && e.currentTarget ? e.currentTarget.closest('.card') : null;
+  const valEl = card ? card.querySelector('.prio-val') : null;
+  const current = valEl ? (parseInt(valEl.textContent, 10) || 0) : 0;
+  const next = current + delta;
+  if (valEl) valEl.textContent = String(next); // optimistic
+  try {
+    const resp = await fetch('/api/priority', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ name, priority: next })
+    });
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || 'failed');
+    if (valEl) valEl.textContent = String(data.priority);
+  } catch(err) {
+    if (valEl) valEl.textContent = String(current); // revert
+    showToast('Priority update failed: ' + err.message);
+  }
+}
+
 async function doRefresh(name, e) {
   if (e) e.stopPropagation();
   try {
@@ -2875,7 +2967,7 @@ async function refresh() {
     }
     document.getElementById('account-count').textContent = profiles.length;
     if (rotationStrategy) {
-      const strategyNames = { sticky: 'Sticky', conserve: 'Conserve', 'round-robin': 'Round-robin', spread: 'Spread', 'drain-first': 'Drain first', balance: 'Balance' };
+      const strategyNames = { sticky: 'Sticky', conserve: 'Conserve', 'round-robin': 'Round-robin', spread: 'Spread', 'drain-first': 'Drain first', balance: 'Balance', priority: 'Priority' };
       document.getElementById('current-strategy').textContent = ' \\u00b7 ' + (strategyNames[rotationStrategy] || rotationStrategy);
     }
     if (probeStats) renderProbeStats(probeStats);
@@ -2940,6 +3032,14 @@ function renderAccounts(profiles, animate) {
     const displayName = p.label || p.name;
     const eName = p.name.replace(/'/g, "\\\\'");
     const tok = tokenStatus(p.expiresAt);
+    const prioVal = Number.isFinite(p.priority) ? p.priority : 0;
+    const priorityHtml =
+      '<div class="card-priority" title="Higher = preferred first. Used by the Priority rotation strategy.">' +
+        '<span class="prio-cap">Priority</span>' +
+        '<button class="prio-btn" onclick="bumpPriority(\\''+eName+'\\',-1,event)">-</button>' +
+        '<span class="prio-val">' + prioVal + '</span>' +
+        '<button class="prio-btn" onclick="bumpPriority(\\''+eName+'\\',1,event)">+</button>' +
+      '</div>';
 
     let barsHtml = '';
     if (p.rateLimits) {
@@ -3010,6 +3110,7 @@ function renderAccounts(profiles, animate) {
         '</div>' +
       '</div>' +
       barsHtml +
+      priorityHtml +
       staleMsg +
       buttonsHtml +
     '</div>';
@@ -3122,6 +3223,7 @@ const STRATEGY_HINTS = {
   spread: 'Picks the least-used account on every request. Switches often  - may trigger Anthropic notices.',
   'drain-first': 'Uses the account with highest 5hr utilization first. Good for short sessions.',
   balance: 'Spreads concurrent requests across accounts, capped per account. Best for running many sessions at once  - avoids per-account rate limits.',
+  priority: 'Prefers your highest-priority account. Falls over to the next one on a rate limit, and switches back as soon as the preferred account recovers. Set each account\\'s priority on its card.',
 };
 
 async function loadSettingsUI() {
@@ -3152,6 +3254,7 @@ const STRATEGY_DETAILS = {
   spread:        { name: 'Spread',      desc: 'Always pick the account with the lowest 5hr utilization on every request. Switches often  - best for short, bursty sessions.' },
   'drain-first': { name: 'Drain first', desc: 'Use the account with the highest 5hr utilization first, draining it before moving on. Good for finishing off nearly-exhausted windows.' },
   balance:       { name: 'Balance',     desc: 'Spread concurrent requests across accounts by least in-flight count, capped per account. When all accounts hit the cap it briefly waits for a free slot, then overflows rather than dropping. Best when running many sessions/subagents at once  - divides per-minute load so no single account gets throttled.' },
+  priority:      { name: 'Priority',    desc: 'Always run on your highest-priority available account. When it hits a rate limit, fail over to the next priority; as soon as the preferred account recovers, switch back up. Set each account\\'s priority (higher = preferred) on its card. Ties break by lowest 5hr utilization.' },
 };
 
 function updateStrategyUI(strategy) {
@@ -4474,6 +4577,31 @@ let _accountsCache = null;
 let _accountsCacheAt = 0;
 const ACCOUNTS_CACHE_TTL = 5000; // 5s  - covers hot path without stale data
 
+// ── Per-account priority (sidecar `.priority`, used by the `priority` strategy) ──
+// Higher number = more preferred. Missing / invalid sidecar means priority 0.
+
+function readAccountPriority(name) {
+  try {
+    const raw = readFileSync(join(ACCOUNTS_DIR, `${name}.priority`), 'utf8').trim();
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function writeAccountPriority(name, priority) {
+  const n = parseInt(priority, 10);
+  const file = join(ACCOUNTS_DIR, `${name}.priority`);
+  if (!Number.isFinite(n) || n === 0) {
+    // 0 is the default — keep the accounts dir clean by removing the sidecar.
+    try { unlinkSync(file); } catch {}
+    return 0;
+  }
+  writeFileSync(file, String(n));
+  return n;
+}
+
 function loadAllAccountTokens() {
   const now = Date.now();
   if (_accountsCache && now - _accountsCacheAt < ACCOUNTS_CACHE_TTL) return _accountsCache;
@@ -4489,8 +4617,9 @@ function loadAllAccountTokens() {
         const name = basename(file, '.json');
         let label = '';
         try { label = readFileSync(join(ACCOUNTS_DIR, `${name}.label`), 'utf8').trim(); } catch {}
+        const priority = readAccountPriority(name);
         const expiresAt = creds.claudeAiOauth?.expiresAt || 0;
-        accounts.push({ name, label, token, creds, expiresAt });
+        accounts.push({ name, label, token, creds, expiresAt, priority });
       } catch { /* skip corrupt */ }
     }
     _accountsCache = accounts;

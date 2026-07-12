@@ -17,6 +17,8 @@ import {
   pickBestAccount,
   pickAnyUntried,
   pickLeastLoaded,
+  accountPriority,
+  pickByPriority,
   pickByStrategy,
   createProbeTracker,
   createUtilizationHistory,
@@ -499,6 +501,122 @@ describe('pickLeastLoaded', () => {
     const inflight = createInflightTracker();
     const pick = pickLeastLoaded(accounts, inflight, sm, 8, new Set(['tokA', 'tokB', 'tokC']));
     assert.equal(pick, null);
+  });
+});
+
+// ─────────────────────────────────────────────────
+// accountPriority / pickByPriority
+// ─────────────────────────────────────────────────
+
+describe('accountPriority', () => {
+  it('reads a numeric priority', () => {
+    assert.equal(accountPriority({ priority: 5 }), 5);
+    assert.equal(accountPriority({ priority: 0 }), 0);
+    assert.equal(accountPriority({ priority: -3 }), -3);
+  });
+
+  it('defaults to 0 for missing / non-numeric priority', () => {
+    assert.equal(accountPriority({}), 0);
+    assert.equal(accountPriority({ priority: undefined }), 0);
+    assert.equal(accountPriority({ priority: 'high' }), 0);
+    assert.equal(accountPriority(null), 0);
+  });
+});
+
+describe('pickByPriority', () => {
+  const accounts = [
+    { name: 'a', token: 'tokA', expiresAt: 0, priority: 1 },
+    { name: 'b', token: 'tokB', expiresAt: 0, priority: 3 },
+    { name: 'c', token: 'tokC', expiresAt: 0, priority: 2 },
+  ];
+
+  it('picks the highest-priority available account', () => {
+    const sm = createAccountStateManager();
+    const pick = pickByPriority(accounts, sm);
+    assert.equal(pick.name, 'b');
+  });
+
+  it('falls over to the next-highest priority when the top is limited', () => {
+    const sm = createAccountStateManager();
+    const now = 1_000_000;
+    sm.markLimited('tokB', 'b', 3);
+    sm.get('tokB').retryAfter = now + 3000; // cooling down
+    const pick = pickByPriority(accounts, sm, new Set(), now);
+    assert.equal(pick.name, 'c', 'skips limited top, takes next priority');
+  });
+
+  it('switches back to the top account once it recovers', () => {
+    const sm = createAccountStateManager();
+    const now = 1_000_000;
+    sm.markLimited('tokB', 'b', 3);
+    sm.get('tokB').retryAfter = now + 3000;
+    assert.equal(pickByPriority(accounts, sm, new Set(), now).name, 'c');
+    // after cooldown, the highest priority is available again
+    assert.equal(pickByPriority(accounts, sm, new Set(), now + 4000).name, 'b');
+  });
+
+  it('tiebreaks equal priority by lowest 5h utilization', () => {
+    const sm = createAccountStateManager();
+    const tied = [
+      { name: 'x', token: 'tokX', expiresAt: 0, priority: 1 },
+      { name: 'y', token: 'tokY', expiresAt: 0, priority: 1 },
+    ];
+    sm.update('tokX', 'x', { 'anthropic-ratelimit-unified-5h-utilization': '0.8' });
+    sm.update('tokY', 'y', { 'anthropic-ratelimit-unified-5h-utilization': '0.2' });
+    assert.equal(pickByPriority(tied, sm).name, 'y');
+  });
+
+  it('treats a missing priority as 0', () => {
+    const sm = createAccountStateManager();
+    const mixed = [
+      { name: 'p', token: 'tokP', expiresAt: 0 },              // priority 0
+      { name: 'q', token: 'tokQ', expiresAt: 0, priority: 1 }, // priority 1
+    ];
+    assert.equal(pickByPriority(mixed, sm).name, 'q');
+  });
+
+  it('excludes excludeTokens and returns null when none remain', () => {
+    const sm = createAccountStateManager();
+    assert.equal(pickByPriority(accounts, sm, new Set(['tokA', 'tokB'])).name, 'c');
+    assert.equal(pickByPriority(accounts, sm, new Set(['tokA', 'tokB', 'tokC'])), null);
+  });
+});
+
+// ─────────────────────────────────────────────────
+// pickByStrategy — priority strategy
+// ─────────────────────────────────────────────────
+
+describe("pickByStrategy — 'priority'", () => {
+  const accounts = [
+    { name: 'a', token: 'tokA', expiresAt: 0, priority: 1 },
+    { name: 'b', token: 'tokB', expiresAt: 0, priority: 3 },
+    { name: 'c', token: 'tokC', expiresAt: 0, priority: 2 },
+  ];
+  const base = { strategy: 'priority', intervalMin: 60, lastRotationTime: 0 };
+
+  it('keeps the current account when it is already the highest priority', () => {
+    const sm = createAccountStateManager();
+    const r = pickByStrategy({ ...base, currentToken: 'tokB', accounts, stateManager: sm });
+    assert.equal(r.account, null);
+    assert.equal(r.rotated, false);
+  });
+
+  it('switches up to a higher-priority account that is available', () => {
+    const sm = createAccountStateManager();
+    // currently on low-priority 'a', but 'b' (higher) is available → switch up
+    const r = pickByStrategy({ ...base, currentToken: 'tokA', accounts, stateManager: sm });
+    assert.equal(r.account.name, 'b');
+    assert.equal(r.rotated, true);
+  });
+
+  it('fails over to the next priority when the current top becomes unavailable', () => {
+    const sm = createAccountStateManager();
+    const now = 1_000_000;
+    sm.markLimited('tokB', 'b', 3);
+    sm.get('tokB').retryAfter = now + 3000;
+    const r = pickByStrategy({ ...base, currentToken: 'tokB', accounts, stateManager: sm, now });
+    assert.equal(r.account.name, 'c', 'forced switch honors priority order');
+    assert.equal(r.rotated, true);
   });
 });
 

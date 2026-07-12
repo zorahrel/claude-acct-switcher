@@ -109,7 +109,8 @@ The hook queries the dashboard for usage data and silently skips the trailer if 
 ```bash
 vdm config proxy on|off           # Token-swapping proxy
 vdm config autoswitch on|off      # Auto-switch on 429/401
-vdm config rotation <strategy>    # sticky|conserve|round-robin|spread|drain-first
+vdm config rotation <strategy>    # sticky|conserve|round-robin|spread|drain-first|balance|priority
+vdm priority <name> <n>           # Per-account priority (higher = preferred; for the 'priority' strategy)
 vdm config interval <minutes>     # Round-robin timer
 vdm config serialize on|off       # Serialize proxy requests
 vdm config serialize-delay <ms>   # Serialization delay
@@ -125,6 +126,10 @@ vdm config commit-tokens on|off  # Token-Usage trailer in commits
 | **Round-robin** | Rotate every N minutes |
 | **Spread** | Always pick lowest utilization |
 | **Drain first** | Use highest 5hr utilization first |
+| **Balance** | Spread concurrent requests across accounts, capped per account |
+| **Priority** | Prefer your highest-priority account; fail over on limit, switch back when it recovers |
+
+**Priority strategy** — Rank your accounts with `vdm priority <name> <n>` (higher = preferred) or the ± control on each dashboard card. The proxy always runs on the highest-priority *available* account: when it hits a rate limit it fails over to the next one down, and as soon as the preferred account's window resets it switches back up. Ties break by lowest 5hr utilization.
 
 ## How It Works
 
