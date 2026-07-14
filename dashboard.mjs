@@ -742,6 +742,28 @@ async function loadProfiles() {
 
       const mine = myTokensFor(email || name);
       const acctSt = accountState.get(oauth.accessToken);
+      // Classify WHY an account is unavailable so the tray can tell apart
+      // "you used up the quota" (unified 5h/7d full) from "blocked for another
+      // reason" — a per-model cap (e.g. weekly Opus) that the unified
+      // utilization doesn't reflect, an auth problem, or a manual opt-out.
+      const u5 = rateLimits?.fiveH?.utilization || 0;
+      const u7 = rateLimits?.sevenD?.utilization || 0;
+      const s5 = rateLimits?.fiveH?.status;
+      const s7 = rateLimits?.sevenD?.status;
+      const isBlocked = !!acctSt?.limited || (acctSt?.retryAfter || 0) > Date.now();
+      let blockKind = null;
+      if (readAccountDisabled(name)) blockKind = 'disabled';
+      else if (proxyExpired) blockKind = 'auth';
+      else if (isBlocked) {
+        // The health probe uses Haiku. If the probe itself is limited (or the
+        // unified window is full) the GENERAL 5h/7d window is exhausted =
+        // consumption. If the probe is 'allowed' yet real requests still 429,
+        // it's a per-model cap the unified window doesn't reflect (e.g. Opus).
+        if (s5 === 'limited' || u5 >= 0.98) blockKind = 'quota-5h';
+        else if (s7 === 'limited' || u7 >= 0.98) blockKind = 'quota-7d';
+        else if (s5 === 'allowed' || s7 === 'allowed') blockKind = 'model';
+        else blockKind = 'blocked'; // no fresh probe yet — don't guess consumption vs model
+      }
       profiles.push({
         name,
         label: email || name,
@@ -760,6 +782,7 @@ async function loadProfiles() {
         // 'allowed' yet 429 on Opus — surfaced here so the tray isn't misleading).
         limited: !!acctSt?.limited,
         retryAfter: acctSt?.retryAfter || 0,
+        blockKind, // null | 'quota-5h' | 'quota-7d' | 'model' | 'disabled' | 'auth'
         myTokens5h: mine.t5,
         myTokens7d: mine.t7,
       });
