@@ -758,7 +758,8 @@ async function loadProfiles() {
         // The health probe uses Haiku. If the probe itself is limited (or the
         // unified window is full) the GENERAL 5h/7d window is exhausted =
         // consumption. If the probe is 'allowed' yet real requests still 429,
-        // it's a per-model cap the unified window doesn't reflect (e.g. Opus).
+        // it's the weekly cap on the CAPABLE models (Opus/Fable/Sonnet — every
+        // model except Haiku) that the unified window doesn't reflect.
         if (s5 === 'limited' || u5 >= 0.98) blockKind = 'quota-5h';
         else if (s7 === 'limited' || u7 >= 0.98) blockKind = 'quota-7d';
         else if (s5 === 'allowed' || s7 === 'allowed') blockKind = 'model';
