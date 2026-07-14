@@ -637,6 +637,25 @@ async function loadProfiles() {
     files = [];
   }
 
+  // My token consumption per account, for the tray's "my share" view. This VDM
+  // only sees traffic routed through it (i.e. mine), so myTokens is a precise
+  // count of MY usage on the shared account; the account-wide utilization (from
+  // Anthropic's headers) is the total (me + everyone else sharing the account).
+  const nowMs = Date.now();
+  const usage = loadTokenUsage();
+  const win5h = nowMs - 5 * 3600 * 1000;
+  const win7d = nowMs - 7 * 24 * 3600 * 1000;
+  const myTokensFor = (acctLabel) => {
+    let t5 = 0, t7 = 0;
+    for (const r of usage) {
+      if (r.account !== acctLabel) continue;
+      const tok = (r.inputTokens || 0) + (r.outputTokens || 0);
+      if (r.ts >= win7d) t7 += tok;
+      if (r.ts >= win5h) t5 += tok;
+    }
+    return { t5, t7 };
+  };
+
   const profiles = [];
   for (const file of files) {
     const name = basename(file, '.json');
@@ -721,6 +740,8 @@ async function loadProfiles() {
         } catch { /* non-critical */ }
       }
 
+      const mine = myTokensFor(email || name);
+      const acctSt = accountState.get(oauth.accessToken);
       profiles.push({
         name,
         label: email || name,
@@ -735,6 +756,12 @@ async function loadProfiles() {
         refreshFailed: refreshFailures.get(name) || null,
         priority: readAccountPriority(name),
         disabled: readAccountDisabled(name),
+        // Real availability + my share, for the tray (an account can be unified
+        // 'allowed' yet 429 on Opus — surfaced here so the tray isn't misleading).
+        limited: !!acctSt?.limited,
+        retryAfter: acctSt?.retryAfter || 0,
+        myTokens5h: mine.t5,
+        myTokens7d: mine.t7,
       });
     } catch {
       // skip corrupt files
