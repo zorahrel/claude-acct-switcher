@@ -748,22 +748,27 @@ async function loadProfiles() {
       // utilization doesn't reflect, an auth problem, or a manual opt-out.
       const u5 = rateLimits?.fiveH?.utilization || 0;
       const u7 = rateLimits?.sevenD?.utilization || 0;
-      const s5 = rateLimits?.fiveH?.status;
-      const s7 = rateLimits?.sevenD?.status;
-      const isBlocked = !!acctSt?.limited || (acctSt?.retryAfter || 0) > Date.now();
+      const cooldownActive = (acctSt?.retryAfter || 0) > Date.now(); // a persisted, real 429 wall
+      // Trust UTILIZATION for a "quota" block and a persisted 429 cooldown for a
+      // per-model block. A bare status:'limited' with LOW utilization is a
+      // transient probe bounce (a rebound 429 makes fetchRateLimits stamp
+      // 'limited' even at 0% usage) — ignore it, otherwise every rebound paints
+      // the account red while the dashboard (which reads utilization) stays green.
       let blockKind = null;
       if (readAccountDisabled(name)) blockKind = 'disabled';
       else if (proxyExpired) blockKind = 'auth';
-      else if (isBlocked) {
-        // The health probe uses Haiku. If the probe itself is limited (or the
-        // unified window is full) the GENERAL 5h/7d window is exhausted =
-        // consumption. If the probe is 'allowed' yet real requests still 429,
-        // it's the weekly cap on the CAPABLE models (Opus/Fable/Sonnet — every
-        // model except Haiku) that the unified window doesn't reflect.
-        if (s5 === 'limited' || u5 >= 0.98) blockKind = 'quota-5h';
-        else if (s7 === 'limited' || u7 >= 0.98) blockKind = 'quota-7d';
-        else if (s5 === 'allowed' || s7 === 'allowed') blockKind = 'model';
-        else blockKind = 'blocked'; // no fresh probe yet — don't guess consumption vs model
+      else if (u5 >= 0.9) blockKind = 'quota-5h';    // 5h window genuinely full
+      else if (u7 >= 0.9) blockKind = 'quota-7d';    // weekly window genuinely full
+      else if (cooldownActive) blockKind = 'model';  // real 429 but utilization low → per-model cap (Opus/Fable/Sonnet)
+      // else: no genuine block (a lone status:'limited' is treated as a bounce)
+
+      // Keep the exposed rate-limit status in sync with blockKind so the tray
+      // (which colours on fiveH.status) doesn't light up on a bounce.
+      const rl = rateLimits ? JSON.parse(JSON.stringify(rateLimits)) : rateLimits;
+      if (rl) {
+        if (rl.fiveH) rl.fiveH.status = (blockKind === 'quota-5h') ? 'limited' : 'allowed';
+        if (rl.sevenD) rl.sevenD.status = (blockKind === 'quota-7d') ? 'limited' : 'allowed';
+        rl.status = (blockKind && blockKind.startsWith('quota')) ? 'limited' : 'allowed';
       }
       profiles.push({
         name,
@@ -773,7 +778,7 @@ async function loadProfiles() {
         expiresAt,
         isActive,
         fingerprint: fp,
-        rateLimits,
+        rateLimits: rl,
         dormant,
         expired: proxyExpired,
         refreshFailed: refreshFailures.get(name) || null,
@@ -781,7 +786,7 @@ async function loadProfiles() {
         disabled: readAccountDisabled(name),
         // Real availability + my share, for the tray (an account can be unified
         // 'allowed' yet 429 on Opus — surfaced here so the tray isn't misleading).
-        limited: !!acctSt?.limited,
+        limited: blockKind !== null,
         retryAfter: acctSt?.retryAfter || 0,
         blockKind, // null | 'quota-5h' | 'quota-7d' | 'model' | 'disabled' | 'auth'
         myTokens5h: mine.t5,
@@ -864,7 +869,7 @@ async function handleAPI(req, res) {
     const allExhausted = allAccounts.length > 0 &&
       allAccounts.every(a => !isAccountAvailable(a.token, a.expiresAt));
     const earliestReset = allExhausted ? getEarliestReset() : null;
-    json(res, { profiles, stats, probeStats, allExhausted, earliestReset, rotationStrategy: settings.rotationStrategy, queueStats: getQueueStats() });
+    json(res, { profiles, stats, probeStats, allExhausted, earliestReset, rotationStrategy: settings.rotationStrategy, queueStats: getQueueStats(), passthrough: _circuitOpen && (Date.now() - _circuitOpenAt <= CIRCUIT_COOLDOWN_MS) });
     return true;
   }
 
