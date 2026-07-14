@@ -4521,11 +4521,20 @@ function savePersistedState() {
 }
 
 function updatePersistedState(fingerprint, data) {
+  // Merge with the existing row: callers may pass only some fields (e.g.
+  // markAccountLimited persists just limited/retryAfter and must not wipe the
+  // utilization numbers). A field is only overwritten when explicitly provided.
+  const prev = persistedState[fingerprint] || {};
+  const pick = (k, d) => (data[k] !== undefined ? data[k] : (prev[k] !== undefined ? prev[k] : d));
   persistedState[fingerprint] = {
-    utilization5h: data.utilization5h || 0,
-    utilization7d: data.utilization7d || 0,
-    resetAt: data.resetAt || 0,
-    resetAt7d: data.resetAt7d || 0,
+    utilization5h: pick('utilization5h', 0),
+    utilization7d: pick('utilization7d', 0),
+    resetAt: pick('resetAt', 0),
+    resetAt7d: pick('resetAt7d', 0),
+    // A hard 429 cooldown, persisted so it survives a proxy restart (otherwise a
+    // kickstart forgets it and re-tries the limited account until it 429s again).
+    limited: pick('limited', false),
+    retryAfter: pick('retryAfter', 0),
     updatedAt: Date.now(),
   };
   savePersistedState();
@@ -4583,13 +4592,23 @@ function updateAccountState(token, name, headers, fingerprint) {
 
     utilizationHistory.record(fingerprint, u5h, u7d);
     weeklyHistory.record(fingerprint, u5h, u7d);
-    updatePersistedState(fingerprint, { utilization5h: u5h, utilization7d: u7d, resetAt: reset5h, resetAt7d: reset7d });
+    // Persist the in-memory limited/retryAfter too (update() preserves an active
+    // cooldown across probes), so a restart hydrates the real availability.
+    const st = accountState.get(token) || {};
+    updatePersistedState(fingerprint, { utilization5h: u5h, utilization7d: u7d, resetAt: reset5h, resetAt7d: reset7d, limited: st.limited || false, retryAfter: st.retryAfter || 0 });
     saveHistoryToDisk();
   }
 }
 
 function markAccountLimited(token, name, retryAfterSec = 0) {
   accountState.markLimited(token, name, retryAfterSec);
+  // Persist the cooldown (merged into the fingerprint's row) so a proxy restart
+  // doesn't forget it and re-try the account until it 429s again.
+  try {
+    const fp = getFingerprintFromToken(token);
+    const st = accountState.get(token) || {};
+    updatePersistedState(fp, { limited: true, retryAfter: st.retryAfter || 0 });
+  } catch { /* best-effort persistence */ }
 }
 
 function markAccountExpired(token, name) {
@@ -4679,6 +4698,22 @@ function invalidateAccountsCache() {
   _accountsCache = null;
   _accountsCacheAt = 0;
 }
+
+// Hydrate in-memory hard cooldowns from disk so a proxy restart doesn't re-try an
+// account still inside a 429 cooldown (the weekly Opus cap can be days long).
+// Runs after loadAllAccountTokens/_accountsCache are defined to avoid a TDZ.
+(function hydrateCooldowns() {
+  const now = Date.now();
+  try {
+    for (const acct of loadAllAccountTokens()) {
+      const fp = getFingerprintFromToken(acct.token);
+      const ps = persistedState[fp];
+      if (ps && ps.retryAfter && ps.retryAfter > now) {
+        accountState.markLimited(acct.token, acct.name, Math.ceil((ps.retryAfter - now) / 1000));
+      }
+    }
+  } catch { /* best-effort */ }
+})();
 
 // ── Account picker ──
 
