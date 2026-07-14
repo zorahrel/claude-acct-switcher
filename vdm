@@ -399,6 +399,40 @@ cmd_priority() {
   echo -e "${GREEN}✓${NC} Set priority of ${BOLD}$name${NC} to ${CYAN}$priority${NC}"
 }
 
+# Enable/disable an account for rotation WITHOUT removing it (sidecar `.disabled`).
+cmd_set_enabled() {
+  local name="${1:-}" enabled="$2" verb="$3"
+  if [[ -z "$name" ]]; then
+    echo -e "${RED}Usage: vdm $verb <name>${NC}"
+    echo "  Excludes/includes an account from rotation without removing it."
+    return 1
+  fi
+  name=$(echo "$name" | tr ' ' '-' | tr '[:upper:]' '[:lower:]')
+  if [[ ! -f "$ACCOUNTS_DIR/${name}.json" ]]; then
+    echo -e "${RED}Profile '$name' not found.${NC}"
+    return 1
+  fi
+  # Prefer the dashboard API (invalidates the account cache so the change takes
+  # effect immediately); fall back to a direct sidecar write.
+  local resp=""
+  if curl -s --max-time 2 "http://localhost:$DASHBOARD_PORT/health" >/dev/null 2>&1; then
+    resp=$(curl -s --max-time 2 -X POST "http://localhost:$DASHBOARD_PORT/api/account-enabled" \
+      -H "Content-Type: application/json" \
+      -d "{\"name\":\"$name\",\"enabled\":$enabled}" 2>/dev/null) || true
+  fi
+  if [[ -z "$resp" ]]; then
+    if [[ "$enabled" == "false" ]]; then : > "$ACCOUNTS_DIR/${name}.disabled"; else rm -f "$ACCOUNTS_DIR/${name}.disabled"; fi
+  fi
+  if [[ "$enabled" == "false" ]]; then
+    echo -e "${YELLOW}✓${NC} Disabled ${BOLD}$name${NC} ${DIM}(excluded from rotation, not removed)${NC}"
+  else
+    echo -e "${GREEN}✓${NC} Enabled ${BOLD}$name${NC}"
+  fi
+}
+
+cmd_disable() { cmd_set_enabled "${1:-}" false disable; }
+cmd_enable()  { cmd_set_enabled "${1:-}" true  enable; }
+
 cmd_list() {
   local active_fp
   active_fp=$(get_active_fingerprint 2>/dev/null) || active_fp=""
@@ -1227,6 +1261,8 @@ cmd_help() {
   echo -e "    ${CYAN}switch${NC} [name]           Switch to a profile (interactive if no name)"
   echo -e "    ${CYAN}remove${NC} <name>           Delete a saved profile"
   echo -e "    ${CYAN}priority${NC} <name> <n>      Set account priority (higher = preferred; 'priority' strategy)"
+  echo -e "    ${CYAN}disable${NC} <name>           Exclude an account from rotation (keeps it saved)"
+  echo -e "    ${CYAN}enable${NC} <name>            Re-include a disabled account in rotation"
   echo -e "    ${CYAN}status${NC}                  Show current account details + settings"
   echo -e "    ${CYAN}config${NC} [key] [on|off]   View or toggle settings (proxy, autoswitch)"
   echo -e "    ${CYAN}dashboard${NC} [start|stop]  Launch/stop the web dashboard"
@@ -1264,6 +1300,8 @@ case "$command" in
   add)       cmd_add "$@" ;;
   label)     cmd_label "$@" ;;
   priority|prio) cmd_priority "$@" ;;
+  disable)   cmd_disable "$@" ;;
+  enable)    cmd_enable "$@" ;;
   list|ls)   cmd_list ;;
   switch|sw) cmd_switch "$@" ;;
   remove|rm) cmd_remove "$@" ;;

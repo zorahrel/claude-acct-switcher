@@ -734,6 +734,7 @@ async function loadProfiles() {
         expired: proxyExpired,
         refreshFailed: refreshFailures.get(name) || null,
         priority: readAccountPriority(name),
+        disabled: readAccountDisabled(name),
       });
     } catch {
       // skip corrupt files
@@ -907,6 +908,30 @@ async function handleAPI(req, res) {
       invalidateAccountsCache();
       logActivity('priority-set', { name, priority: saved });
       json(res, { ok: true, name, priority: saved });
+    } catch (e) {
+      json(res, { ok: false, error: e.message }, 400);
+    }
+    return true;
+  }
+
+  if (url.pathname === '/api/account-enabled' && req.method === 'POST') {
+    const body = await readBody(req);
+    const { name, enabled } = JSON.parse(body);
+    if (!name) {
+      json(res, { ok: false, error: 'name required' }, 400);
+      return true;
+    }
+    if (!existsSync(join(ACCOUNTS_DIR, `${name}.json`))) {
+      json(res, { ok: false, error: `Unknown account "${name}"` }, 404);
+      return true;
+    }
+    try {
+      // Disabling the active account is fine: the next request finds it absent
+      // from the rotation pool and switches away automatically.
+      const disabled = writeAccountDisabled(name, enabled === false);
+      invalidateAccountsCache();
+      logActivity('account-enabled', { name, enabled: !disabled });
+      json(res, { ok: true, name, enabled: !disabled });
     } catch (e) {
       json(res, { ok: false, error: e.message }, 400);
     }
@@ -4602,6 +4627,25 @@ function writeAccountPriority(name, priority) {
   return n;
 }
 
+// ── Per-account enable/disable (sidecar `.disabled`) ──
+// Presence of the file = the account is opted out of the rotation pool (but not
+// removed). loadAllAccountTokens() tags each account with `disabled`, which the
+// pickers in lib.mjs treat as never-selectable. loadProfiles() still lists it so
+// the dashboard/tray can show it as disabled.
+function readAccountDisabled(name) {
+  return existsSync(join(ACCOUNTS_DIR, `${name}.disabled`));
+}
+
+function writeAccountDisabled(name, disabled) {
+  const file = join(ACCOUNTS_DIR, `${name}.disabled`);
+  if (disabled) {
+    writeFileSync(file, '');
+    return true;
+  }
+  try { unlinkSync(file); } catch {}
+  return false;
+}
+
 function loadAllAccountTokens() {
   const now = Date.now();
   if (_accountsCache && now - _accountsCacheAt < ACCOUNTS_CACHE_TTL) return _accountsCache;
@@ -4618,8 +4662,9 @@ function loadAllAccountTokens() {
         let label = '';
         try { label = readFileSync(join(ACCOUNTS_DIR, `${name}.label`), 'utf8').trim(); } catch {}
         const priority = readAccountPriority(name);
+        const disabled = readAccountDisabled(name);
         const expiresAt = creds.claudeAiOauth?.expiresAt || 0;
-        accounts.push({ name, label, token, creds, expiresAt, priority });
+        accounts.push({ name, label, token, creds, expiresAt, priority, disabled });
       } catch { /* skip corrupt */ }
     }
     _accountsCache = accounts;

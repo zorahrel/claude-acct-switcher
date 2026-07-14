@@ -292,7 +292,7 @@ export function scoreAccount(token, stateManager) {
 
 export function pickBestAccount(accounts, stateManager, excludeTokens = new Set()) {
   const candidates = accounts
-    .filter(a => !excludeTokens.has(a.token) && isAccountAvailable(a.token, a.expiresAt, stateManager))
+    .filter(a => !excludeTokens.has(a.token) && !a.disabled && isAccountAvailable(a.token, a.expiresAt, stateManager))
     .map(a => ({ ...a, score: scoreAccount(a.token, stateManager) }))
     .sort((a, b) => a.score - b.score);
   return candidates[0] || null;
@@ -300,7 +300,7 @@ export function pickBestAccount(accounts, stateManager, excludeTokens = new Set(
 
 export function pickDrainFirst(accounts, stateManager, excludeTokens = new Set()) {
   const candidates = accounts
-    .filter(a => !excludeTokens.has(a.token) && isAccountAvailable(a.token, a.expiresAt, stateManager))
+    .filter(a => !excludeTokens.has(a.token) && !a.disabled && isAccountAvailable(a.token, a.expiresAt, stateManager))
     .map(a => ({ ...a, score: scoreAccount(a.token, stateManager) }))
     .sort((a, b) => b.score - a.score); // highest utilization first
   return candidates[0] || null;
@@ -324,14 +324,16 @@ export function scoreAccountConserve(token, stateManager) {
 
 export function pickConserve(accounts, stateManager, excludeTokens = new Set()) {
   const candidates = accounts
-    .filter(a => !excludeTokens.has(a.token) && isAccountAvailable(a.token, a.expiresAt, stateManager))
+    .filter(a => !excludeTokens.has(a.token) && !a.disabled && isAccountAvailable(a.token, a.expiresAt, stateManager))
     .map(a => ({ ...a, score: scoreAccountConserve(a.token, stateManager) }))
     .sort((a, b) => b.score - a.score); // highest combined utilization first
   return candidates[0] || null;
 }
 
 export function pickAnyUntried(accounts, excludeTokens) {
-  return accounts.find(a => !excludeTokens.has(a.token)) || null;
+  // Excludes user-disabled accounts even though this is the "even if limited"
+  // fallback: a disabled account is an explicit opt-out, stronger than limited.
+  return accounts.find(a => !excludeTokens.has(a.token) && !a.disabled) || null;
 }
 
 /**
@@ -360,7 +362,7 @@ export function accountPriority(account) {
  */
 export function pickByPriority(accounts, stateManager, excludeTokens = new Set(), now = Date.now()) {
   const candidates = accounts
-    .filter(a => !excludeTokens.has(a.token) && isAccountAvailable(a.token, a.expiresAt, stateManager, now))
+    .filter(a => !excludeTokens.has(a.token) && !a.disabled && isAccountAvailable(a.token, a.expiresAt, stateManager, now))
     .map(a => ({ ...a, prio: accountPriority(a), score: scoreAccount(a.token, stateManager) }))
     .sort((a, b) =>
       (b.prio - a.prio) ||           // higher priority first
@@ -389,7 +391,7 @@ export function pickByPriority(accounts, stateManager, excludeTokens = new Set()
  */
 export function pickLeastLoaded(accounts, inflightTracker, stateManager, cap, excludeTokens = new Set(), now = Date.now()) {
   const candidates = accounts
-    .filter(a => !excludeTokens.has(a.token) && isAccountAvailable(a.token, a.expiresAt, stateManager, now))
+    .filter(a => !excludeTokens.has(a.token) && !a.disabled && isAccountAvailable(a.token, a.expiresAt, stateManager, now))
     .map(a => ({
       account: a,
       inflight: inflightTracker.get(a.name),

@@ -615,6 +615,16 @@ describe('pickByPriority', () => {
     assert.equal(pickByPriority(accounts, sm, new Set(['tokA', 'tokB'])).name, 'c');
     assert.equal(pickByPriority(accounts, sm, new Set(['tokA', 'tokB', 'tokC'])), null);
   });
+
+  it('never selects a disabled account, even as the top priority', () => {
+    const sm = createAccountStateManager();
+    const withDisabled = [
+      { name: 'a', token: 'tokA', expiresAt: 0, priority: 1 },
+      { name: 'b', token: 'tokB', expiresAt: 0, priority: 3, disabled: true }, // opted out
+      { name: 'c', token: 'tokC', expiresAt: 0, priority: 2 },
+    ];
+    assert.equal(pickByPriority(withDisabled, sm).name, 'c', 'disabled top is skipped');
+  });
 });
 
 // ─────────────────────────────────────────────────
