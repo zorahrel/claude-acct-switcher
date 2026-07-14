@@ -83,16 +83,26 @@ export function createAccountStateManager() {
     const u7d = parseFloat(headers['anthropic-ratelimit-unified-7d-utilization'] || '0');
     const reset5h = Number(headers['anthropic-ratelimit-unified-5h-reset'] || 0);
     const reset7d = Number(headers['anthropic-ratelimit-unified-7d-reset'] || 0);
+    // Preserve a still-active hard cooldown set by markLimited() from a real 429.
+    // The unified-status header reflects only the account-wide/probe model (the
+    // health probe uses Haiku), so an 'allowed' here does NOT mean a PER-MODEL
+    // limit (e.g. the weekly Opus cap) has lifted. Blindly resetting retryAfter to
+    // 0 on every 200 let the Haiku probe wipe the Opus cooldown, so `priority`
+    // kept re-electing the account and hitting 429 on every request. A real 429's
+    // explicit retry-after outranks a probe until it expires.
+    const prev = state.get(token) || {};
+    const now = Date.now();
+    const activeCooldown = prev.retryAfter && prev.retryAfter > now ? prev.retryAfter : 0;
     state.set(token, {
       name,
-      limited: status === 'limited',
+      limited: status === 'limited' || activeCooldown > 0,
       expired: false,
       resetAt: reset5h,
       resetAt7d: reset7d,
-      retryAfter: 0,
+      retryAfter: activeCooldown,
       utilization5h: u5h,
       utilization7d: u7d,
-      updatedAt: Date.now(),
+      updatedAt: now,
     });
   }
 

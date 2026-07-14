@@ -262,6 +262,41 @@ describe('createAccountStateManager', () => {
     sm.clearBillingCooldown('nonexistent'); // should not throw
     assert.equal(sm.get('nonexistent'), undefined);
   });
+
+  it('update() preserves an active hard cooldown from a real 429 (per-model limit)', () => {
+    const sm = createAccountStateManager();
+    sm.markLimited('tok1', 'acct1', 3600); // real 429 → 1h cooldown
+    assert.ok(sm.get('tok1').retryAfter > Date.now(), 'cooldown set in the future');
+    // A later health probe (Haiku) succeeds → account-wide status 'allowed'.
+    // It must NOT wipe a per-model (e.g. Opus) cooldown the probe can't see.
+    sm.update('tok1', 'acct1', {
+      'anthropic-ratelimit-unified-status': 'allowed',
+      'anthropic-ratelimit-unified-5h-utilization': '0.0',
+      'anthropic-ratelimit-unified-7d-utilization': '0.66',
+    });
+    const after = sm.get('tok1');
+    assert.equal(after.limited, true, 'still limited while cooldown active');
+    assert.ok(after.retryAfter > Date.now(), 'retryAfter preserved across the probe');
+    assert.equal(after.utilization7d, 0.66, 'utilization is still refreshed');
+  });
+
+  it('update() clears a hard cooldown once it has expired', () => {
+    const sm = createAccountStateManager();
+    sm.markLimited('tok1', 'acct1', -100); // cooldown already in the past
+    sm.update('tok1', 'acct1', { 'anthropic-ratelimit-unified-status': 'allowed' });
+    const after = sm.get('tok1');
+    assert.equal(after.retryAfter, 0, 'expired cooldown cleared');
+    assert.equal(after.limited, false, 'no longer limited');
+  });
+
+  it('a 429 cooldown keeps an account unavailable across a successful probe', () => {
+    const sm = createAccountStateManager();
+    const now = Date.now();
+    sm.markLimited('tok1', 'acct1', 3600);
+    sm.update('tok1', 'acct1', { 'anthropic-ratelimit-unified-status': 'allowed' });
+    assert.equal(isAccountAvailable('tok1', 0, sm, now), false,
+      'an active 429 cooldown must survive an allowed probe (regression: Opus 429 loop)');
+  });
 });
 
 // ─────────────────────────────────────────────────
