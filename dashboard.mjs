@@ -389,8 +389,10 @@ async function autoDiscoverAccount() {
   let idx = 1;
   while (existsSync(join(ACCOUNTS_DIR, `auto-${idx}.json`))) idx++;
 
-  // Cap auto-discovered accounts to prevent runaway creation during error spirals
-  const MAX_AUTO_ACCOUNTS = 5;
+  // Backstop against runaway creation (error spirals are already gated separately
+  // by the _consecutive400s check at the autoDiscoverAccount call site). Set high
+  // enough not to block legitimate multi-account setups.
+  const MAX_AUTO_ACCOUNTS = 25;
   if (idx > MAX_AUTO_ACCOUNTS) {
     console.log(`[auto-discover] Skipping — already ${idx - 1} auto accounts (max ${MAX_AUTO_ACCOUNTS})`);
     return;
@@ -802,6 +804,7 @@ async function handleAPI(req, res) {
       p.weeklyHistory = weeklyHistory.getHistory(p.fingerprint);
       p.velocity5h = utilizationHistory.getVelocity(p.fingerprint);
       p.minutesToLimit = utilizationHistory.predictMinutesToLimit(p.fingerprint);
+      p.inflight = balanceLimiter.get(p.name); // balance-mode concurrent in-flight (0 in other modes)
     }
     const stats = await loadStats();
     const probeStats = getProbeStats();
@@ -810,7 +813,7 @@ async function handleAPI(req, res) {
     const allExhausted = allAccounts.length > 0 &&
       allAccounts.every(a => !isAccountAvailable(a.token, a.expiresAt));
     const earliestReset = allExhausted ? getEarliestReset() : null;
-    json(res, { profiles, stats, probeStats, allExhausted, earliestReset, rotationStrategy: settings.rotationStrategy, queueStats: getQueueStats() });
+    json(res, { profiles, stats, probeStats, allExhausted, earliestReset, rotationStrategy: settings.rotationStrategy, balanceCap: settings.maxConcurrentPerAccount || 8, queueStats: getQueueStats() });
     return true;
   }
 
@@ -1508,6 +1511,17 @@ function renderHTML() {
   .badge-pro { color: var(--primary); background: var(--blue-soft); border-color: var(--blue-border); }
   .badge-free { color: var(--muted); background: var(--bg); border-color: var(--border); }
   .badge-active { color: var(--green); background: var(--green-soft); border-color: var(--green-border); }
+
+  /* Balance-mode per-account in-flight count */
+  .badge-inflight { gap: 0.375rem; font-variant-numeric: tabular-nums; }
+  .badge-inflight .inflight-cap { opacity: 0.5; font-weight: 400; }
+  .badge-inflight .inflight-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex: none; }
+  .inflight-idle { color: var(--muted); background: var(--bg); border-color: var(--border); }
+  .inflight-idle .inflight-dot { opacity: 0.35; }
+  .inflight-active { color: var(--purple); background: var(--purple-soft); border-color: var(--purple-border); }
+  .inflight-active .inflight-dot { animation: inflightPulse 1.4s ease-in-out infinite; }
+  .inflight-full { color: var(--yellow); background: var(--yellow-soft); border-color: var(--yellow-border); }
+  @keyframes inflightPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
 
   .card-token.tok-bad { color: var(--red); }
 
@@ -2659,6 +2673,22 @@ function planBadge(subscriptionType, rateLimitTier) {
   return '<span class="badge ' + cls + '">' + label + '</span>';
 }
 
+// Balance mode only: a live count of concurrent in-flight requests routed to this
+// account, out of the per-account cap. Purple pulse = actively serving; yellow = at
+// cap (further requests wait for a slot, then overflow). Empty string in other modes,
+// where the proxy pins a single keychain account and per-account in-flight is always 0.
+function inflightBadge(p, balanceMode, cap) {
+  if (!balanceMode) return '';
+  const n = p.inflight || 0;
+  const c = cap || 8;
+  let cls = 'inflight-idle';
+  if (n >= c) cls = 'inflight-full';
+  else if (n > 0) cls = 'inflight-active';
+  const title = n + (n === 1 ? ' request' : ' requests') + ' in-flight (cap ' + c + ' per account)';
+  return '<span class="badge badge-inflight ' + cls + '" title="' + title + '">' +
+    '<span class="inflight-dot"></span>' + n + '<span class="inflight-cap">/' + c + '</span></span>';
+}
+
 function showToast(msg) {
   const t = document.getElementById('toast');
   t.textContent = msg;
@@ -2866,12 +2896,15 @@ function quickHash(obj) {
 async function refresh() {
   try {
     const resp = await fetch('/api/profiles');
-    const { profiles, stats, probeStats, allExhausted, earliestReset, rotationStrategy, queueStats } = await resp.json();
+    const { profiles, stats, probeStats, allExhausted, earliestReset, rotationStrategy, balanceCap, queueStats } = await resp.json();
     _cachedProfiles = profiles;
-    const ph = quickHash(profiles);
+    const balanceMode = rotationStrategy === 'balance';
+    const cap = balanceCap || 8;
+    // Fold balance context into the hash so strategy/cap flips also force a re-render.
+    const ph = quickHash({ profiles, balanceMode, cap });
     if (ph !== _lastProfilesHash) {
       _lastProfilesHash = ph;
-      renderAccounts(profiles, _firstRender);
+      renderAccounts(profiles, _firstRender, balanceMode, cap);
     }
     document.getElementById('account-count').textContent = profiles.length;
     if (rotationStrategy) {
@@ -2929,7 +2962,7 @@ async function refresh() {
   }
 }
 
-function renderAccounts(profiles, animate) {
+function renderAccounts(profiles, animate, balanceMode, balanceCap) {
   const el = document.getElementById('accounts');
   if (!profiles.length) {
     el.innerHTML = '<div class="empty-state">No accounts yet. Run <code>/login</code> in Claude Code  - accounts are auto-discovered.</div>';
@@ -3005,6 +3038,7 @@ function renderAccounts(profiles, animate) {
           (active ? renderVelocityInline(p) : '') +
         '</div>' +
         '<div class="card-badges">' +
+          inflightBadge(p, balanceMode, balanceCap) +
           planBadge(p.subscriptionType, p.rateLimitTier) +
           (active ? '<span class="badge badge-active">Active</span>' : '') +
         '</div>' +
