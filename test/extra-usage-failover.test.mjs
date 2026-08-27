@@ -10,7 +10,11 @@ import { dirname, join } from 'node:path';
 import { createAccountStateManager } from '../lib.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const src = readFileSync(join(here, '..', 'dashboard.mjs'), 'utf8');
+// Normalised to LF on read. These tests slice the source on "\n}\n"; if git
+// checked the file out with CRLF (the Windows default) that needle never
+// matches, and the failure reads "<function> is not defined" — which points at
+// the code rather than at the invisible byte that actually broke it.
+const src = readFileSync(join(here, '..', 'dashboard.mjs'), 'utf8').replace(/\r\n/g, '\n');
 const match = src.match(/const isBillingError = ([^;]+);/);
 assert.ok(match, 'billing error classifier not found in dashboard.mjs');
 const isBillingError = new Function('errorMessage', `return ${match[1]};`);

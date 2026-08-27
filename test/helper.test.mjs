@@ -11,10 +11,13 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
-const HELPER = join(new URL('.', import.meta.url).pathname, '..', 'vdm-helper.mjs');
+// fileURLToPath, not URL.pathname: on Windows the latter yields "/C:/Users/...",
+// with a leading slash that no filesystem call accepts.
+const HELPER = join(dirname(fileURLToPath(import.meta.url)), '..', 'vdm-helper.mjs');
 
 function helper(args, { stdin = '' } = {}) {
   const res = spawnSync(process.execPath, [HELPER, ...args], {

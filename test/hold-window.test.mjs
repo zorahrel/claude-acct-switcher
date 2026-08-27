@@ -9,7 +9,11 @@ import { dirname, join } from 'node:path';
 import { formatDuration } from '../lib.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const DASH = readFileSync(join(HERE, '..', 'dashboard.mjs'), 'utf8');
+// Normalised to LF on read. These tests slice the source on "\n}\n"; if git
+// checked the file out with CRLF (the Windows default) that needle never
+// matches, and the failure reads "<function> is not defined" — which points at
+// the code rather than at the invisible byte that actually broke it.
+const DASH = readFileSync(join(HERE, '..', 'dashboard.mjs'), 'utf8').replace(/\r\n/g, '\n');
 
 // ── formatDuration ──
 

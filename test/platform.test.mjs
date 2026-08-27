@@ -10,10 +10,13 @@ import { test, describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, readdirSync, existsSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
-const HERE = new URL('.', import.meta.url).pathname;
+// fileURLToPath, not URL.pathname: the latter returns "/C:/Users/..." on
+// Windows, which every fs call rejects.
+const HERE = dirname(fileURLToPath(import.meta.url));
 const PLATFORM_MJS = join(HERE, '..', 'platform.mjs');
 
 // The module resolves HOME once at import time, so each scenario runs in a child

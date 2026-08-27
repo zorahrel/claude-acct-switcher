@@ -18,7 +18,11 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const src = readFileSync(join(here, '..', 'dashboard.mjs'), 'utf8');
+// Normalised to LF on read. These tests slice the source on "\n}\n"; if git
+// checked the file out with CRLF (the Windows default) that needle never
+// matches, and the failure reads "<function> is not defined" — which points at
+// the code rather than at the invisible byte that actually broke it.
+const src = readFileSync(join(here, '..', 'dashboard.mjs'), 'utf8').replace(/\r\n/g, '\n');
 
 // Lift updateAccountState() out of the server module: dashboard.mjs binds ports
 // and reads the keychain on import, so it cannot be imported in a test.

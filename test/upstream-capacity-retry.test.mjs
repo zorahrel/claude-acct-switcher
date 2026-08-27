@@ -10,7 +10,11 @@ import { dirname, join } from 'node:path';
 import { UPSTREAM_RETRY_BACKOFF_MS, getUpstreamRetryPlan, isRetryableUpstreamStatus } from '../lib.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const src = readFileSync(join(here, '..', 'dashboard.mjs'), 'utf8');
+// Normalised to LF on read. These tests slice the source on "\n}\n"; if git
+// checked the file out with CRLF (the Windows default) that needle never
+// matches, and the failure reads "<function> is not defined" — which points at
+// the code rather than at the invisible byte that actually broke it.
+const src = readFileSync(join(here, '..', 'dashboard.mjs'), 'utf8').replace(/\r\n/g, '\n');
 const start = src.indexOf('// ── 5xx / 529: Claude capacity failure');
 const end = src.indexOf('// ── 200 whose failure is inside the stream', start);
 assert.ok(start >= 0 && end > start, 'upstream-capacity branch not found');
