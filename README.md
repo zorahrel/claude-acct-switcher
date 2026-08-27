@@ -73,9 +73,14 @@ Fetches the latest release, auto-installs hooks, and restarts the dashboard.
 Accounts are auto-discovered — just log in:
 
 ```bash
-claude login    # account A
-claude login    # account B — that's it
+claude auth login                           # account A
+claude auth logout && claude auth login     # account B — that's it
+claude auth status                          # which account am I on?
+vdm list                                    # what has VDM saved?
 ```
+
+Note the `auth` in there: Claude Code 2.x moved these under `claude auth`, and a
+plain `claude login` is not a command any more.
 
 ### CLI (`vdm`)
 
