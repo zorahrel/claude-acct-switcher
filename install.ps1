@@ -34,10 +34,24 @@ if (-not $node) {
   Write-Err "Node.js is required. Install it from https://nodejs.org/ (LTS) and re-run."
   exit 1
 }
-$nodeVersion = (& node -v) -replace '^v', ''
-$nodeMajor = [int]($nodeVersion -split '\.')[0]
-if ($nodeMajor -lt 18) {
-  Write-Err "Node.js 18+ required (found v$nodeVersion)."
+# `node -v` normally prints "v22.1.0", but not always: nvm-windows with no
+# version selected prints "No node.js version selected.", and a broken install
+# can print nothing at all. Casting that to [int] threw a PowerShell type error
+# and buried the actual problem under a stack trace — the first thing a new user
+# would see, and unactionable.
+$nodeVersionRaw = (& node -v 2>&1 | Out-String).Trim()
+if ($nodeVersionRaw -match 'v?(\d+)\.(\d+)\.(\d+)') {
+  $nodeMajor = [int]$Matches[1]
+  $nodeVersion = "$($Matches[1]).$($Matches[2]).$($Matches[3])"
+  if ($nodeMajor -lt 18) {
+    Write-Err "Node.js 18+ required (found v$nodeVersion)."
+    exit 1
+  }
+} else {
+  Write-Err "``node -v`` did not report a version. It said:"
+  Write-Host "    $nodeVersionRaw"
+  Write-Step "If you use nvm-windows, pick a version first:  nvm use 22"
+  Write-Step "Otherwise reinstall Node.js from https://nodejs.org/"
   exit 1
 }
 
