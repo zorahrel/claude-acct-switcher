@@ -1306,6 +1306,10 @@ async function loadProfiles() {
       else if (u5 >= 0.9) blockKind = 'quota-5h';    // 5h window genuinely full
       else if (u7 >= 0.9) blockKind = 'quota-7d';    // weekly window genuinely full
       else if (acctSt?.blockKind === 'extra-usage') blockKind = 'extra-usage';
+      // Before 'model': a permission block also sets a cooldown, and labelling an
+      // org policy as a per-model cap sends the reader hunting for a quota that
+      // will never appear — this one does not lift on its own.
+      else if (acctSt?.blockKind === 'permission') blockKind = 'permission';
       else if (cooldownActive) blockKind = 'model';  // real 429 but utilization low → per-model cap (Opus/Fable/Sonnet)
       // else: no genuine block (a lone status:'limited' is treated as a bounce)
 
@@ -1350,7 +1354,7 @@ async function loadProfiles() {
         // 'allowed' yet 429 on Opus — surfaced here so the tray isn't misleading).
         limited: blockKind !== null,
         retryAfter: acctSt?.retryAfter || 0,
-        blockKind, // null | 'quota-5h' | 'quota-7d' | 'extra-usage' | 'model' | 'disabled' | 'auth'
+        blockKind, // null | 'quota-5h' | 'quota-7d' | 'extra-usage' | 'permission' | 'model' | 'disabled' | 'auth'
         myTokens5h: mine.t5,
         myTokens7d: mine.t7,
         // What the caps are and whether they've bitten, for the card + the badge.
@@ -4245,6 +4249,16 @@ function renderAccounts(profiles, animate) {
     const extraUsageMsg = extraUsageBlocked
       ? '<div class="extra-usage-msg">Extra usage exhausted. The 5h and weekly bars are plan limits, not the third-party allowance used by jcode.</div>'
       : '';
+    // A permission block is the one state the user cannot wait out: nothing here
+    // expires, so the message has to say what to actually do about it.
+    const permissionBlocked = p.blockKind === 'permission';
+    const permissionMsg = permissionBlocked
+      // No apostrophe anywhere in this string, deliberately: the page is built
+      // from a template literal, so an escaped quote gets un-escaped once by the
+      // outer template and reaches the browser as a real quote, ending the JS
+      // string and killing the whole inline script. Rephrasing costs nothing.
+      ? '<div class="extra-usage-msg">Anthropic refuses OAuth for the organization of this account (403). It does not expire on its own: an admin must allow Claude Code, or remove the account with <code>vdm remove</code>.</div>'
+      : '';
 
     // Per-account cap override. Empty means "inherit the global cap", which the
     // placeholder shows, so an empty box is never ambiguous between "no cap" and
@@ -4376,11 +4390,13 @@ function renderAccounts(profiles, animate) {
           (capCfg.over ? '<span class="badge" style="background:var(--yellow-soft);color:var(--yellow);border:1px solid var(--yellow-border)">Cap raggiunto</span>' : '') +
           (isOff ? '<span class="badge badge-off">Disabled</span>' : '') +
           (extraUsageBlocked ? '<span class="badge badge-extra-usage">Extra usage exhausted</span>' : '') +
+          (permissionBlocked ? '<span class="badge badge-extra-usage">OAuth not allowed</span>' : '') +
           (active ? '<span class="badge badge-active">Active</span>' : '') +
         '</div>' +
       '</div>' +
       barsHtml +
       extraUsageMsg +
+      permissionMsg +
       // The cap control sits on the priority row: both are knobs that decide whether this
       // account gets picked, so they belong together rather than split across the card.
       priorityRow(capRow) +
@@ -6022,6 +6038,30 @@ function markAccountLimited(token, name, retryAfterSec = 0, blockKind = 'model')
 
 function markAccountExpired(token, name) {
   accountState.markExpired(token, name);
+}
+
+// A 403 permission_error is not a rate limit and not an expired token: the
+// credentials are fine, the organization simply forbids this kind of access
+// (`oauth_not_allowed_for_organization`). Nothing about it expires, so it is
+// deliberately NOT filed under markAccountLimited — a rate limit clears when its
+// window rolls over, and that would put a permanently unusable account straight
+// back into rotation.
+//
+// The cooldown is long rather than infinite so that an org whose policy is
+// changed back recovers on its own instead of needing a restart.
+const PERMISSION_BLOCK_SEC = 6 * 60 * 60; // 6h
+
+function markAccountPermissionBlocked(token, name) {
+  accountState.markLimited(token, name, PERMISSION_BLOCK_SEC, 'permission');
+  try {
+    const fp = getFingerprintFromToken(token);
+    const st = accountState.get(token) || {};
+    updatePersistedState(fp, {
+      limited: true,
+      retryAfter: st.retryAfter || 0,
+      blockKind: 'permission',
+    });
+  } catch { /* best-effort persistence */ }
 }
 
 // ── Load saved accounts from disk ──
@@ -8545,6 +8585,58 @@ async function handleProxyRequest(clientReq, clientRes) {
           message: 'All account tokens are expired. Re-add accounts with: vdm add <name>',
         },
       }));
+      return;
+    }
+
+    // ── 403: Permission denied → this account cannot serve traffic, move on ──
+    //
+    // Measured on a real account: Anthropic answers `403 permission_error` with
+    // `oauth_not_allowed_for_organization` when an org has OAuth disabled. The
+    // token is valid and the health probe sees nothing wrong, so without this
+    // branch the account keeps getting picked — and under `spread`, which
+    // prefers the LEAST used account, it is picked *first* every time, because
+    // an account that never serves a request never accumulates usage. One dead
+    // account starved the whole rotation while healthy ones sat idle.
+    if (status === 403) {
+      const errBody = await drainResponse(proxyRes);
+      let reason = 'permission denied';
+      try {
+        const parsed = JSON.parse(errBody.toString('utf8'));
+        reason = parsed?.error?.details?.error_code || parsed?.error?.message || reason;
+      } catch { /* keep the generic reason */ }
+      log('switch', `${acctName} → 403 ${reason}`);
+
+      markAccountPermissionBlocked(token, acctName);
+      logEvent('permission-blocked', { account: acctName, reason });
+
+      if (settings.autoSwitch || balanceMode) {
+        const next = balanceMode
+          ? await balanceSwitch(triedTokens)
+          : (pickBestAccount(triedTokens) || pickAnyUntried(triedTokens));
+        if (next) {
+          log(balanceMode ? 'balance' : 'switch', `  → switching to ${next.label || next.name}`);
+          if (!balanceMode) {
+            try {
+              await withSwitchLock(() => {
+                writeKeychain(next.creds);
+                invalidateTokenCache();
+              });
+            } catch (e) {
+              log('warn', `Keychain write failed during 403 switch: ${e.message}`);
+            }
+          }
+          token = next.token;
+          logEvent('auto-switch', { from: acctName, to: next.label || next.name, reason: '403' });
+          continue;
+        }
+      }
+
+      // No other account left. When every account answers 403 the cause is the
+      // request, not the accounts, so the upstream error is the honest reply —
+      // manufacturing a proxy error here would hide the real diagnosis.
+      log('switch', '  → no other account available — returning the upstream 403');
+      clientRes.writeHead(403, { 'Content-Type': 'application/json' });
+      clientRes.end(errBody);
       return;
     }
 
