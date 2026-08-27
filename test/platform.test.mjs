@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, readdirSync, existsSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
 // fileURLToPath, not URL.pathname: the latter returns "/C:/Users/..." on
@@ -29,7 +29,10 @@ function runInFakeHome(home, script) {
       ...process.env,
       HOME: home,
       USERPROFILE: home,
-      VDM_PLATFORM_MJS: PLATFORM_MJS.replace(/\\/g, '/'),
+      // A dynamic import() needs a URL, and on Windows a bare "C:\..." path is
+      // rejected outright (ERR_UNSUPPORTED_ESM_URL_SCHEME: "c:" reads as a
+      // protocol). pathToFileURL produces the file:// form both platforms accept.
+      VDM_PLATFORM_MJS: pathToFileURL(PLATFORM_MJS).href,
     },
   });
   if (res.status !== 0) {
