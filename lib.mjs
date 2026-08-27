@@ -71,35 +71,132 @@ export function buildForwardHeaders(originalHeaders, token) {
 }
 
 // ─────────────────────────────────────────────────
+// Transient upstream failures
+// ─────────────────────────────────────────────────
+
+// Kept below VDM's 45-second request deadline. These retries are safe only
+// before a response has been sent to the client; callers retry the same account
+// because a Claude capacity incident is not an account failure.
+export const UPSTREAM_RETRY_BACKOFF_MS = Object.freeze([1000, 2000, 4000]);
+
+export function isRetryableUpstreamStatus(status) {
+  return status === 529 || [500, 502, 503, 504].includes(status);
+}
+
+export function getUpstreamRetryPlan(status, retriesSoFar = 0) {
+  if (!isRetryableUpstreamStatus(status) || retriesSoFar >= UPSTREAM_RETRY_BACKOFF_MS.length) return null;
+  return { attempt: retriesSoFar + 1, delayMs: UPSTREAM_RETRY_BACKOFF_MS[retriesSoFar] };
+}
+
+// ─────────────────────────────────────────────────
 // Account state management
 // ─────────────────────────────────────────────────
 
 export function createAccountStateManager() {
   const state = new Map();
 
-  function update(token, name, headers) {
+  // Each rate-limit field is preserved independently when its header is absent.
+  //
+  // Response-level all-or-nothing is not enough: a 429 routinely carries
+  // `unified-status: limited` with NO utilization headers. Treating that as a
+  // reading writes 0% over a genuine 100%, which both blanks the card and — since
+  // the usage cap reads the same field — quietly makes a capped account
+  // selectable again. Absent header means "said nothing about this", never zero.
+  const LIMIT_HEADERS = [
+    'anthropic-ratelimit-unified-status',
+    'anthropic-ratelimit-unified-5h-utilization',
+    'anthropic-ratelimit-unified-7d-utilization',
+    'anthropic-ratelimit-unified-5h-reset',
+    'anthropic-ratelimit-unified-7d-reset',
+  ];
+
+  function update(token, name, headers, { preserveExtraUsageMarker = false } = {}) {
+    const known = state.get(token);
+    if (!LIMIT_HEADERS.some(k => headers[k] !== undefined)) {
+      // Nothing at all about limits. Keep the whole last reading, including its
+      // age — callers use `updatedAt` to decide when to re-probe, so refreshing it
+      // here would suppress the probe that could actually learn something.
+      // `expired` clears because a response did arrive, which is evidence the
+      // token itself is live.
+      if (known) state.set(token, { ...known, name, expired: false });
+      return;
+    }
     const status = headers['anthropic-ratelimit-unified-status'];
-    const u5h = parseFloat(headers['anthropic-ratelimit-unified-5h-utilization'] || '0');
-    const u7d = parseFloat(headers['anthropic-ratelimit-unified-7d-utilization'] || '0');
-    const reset5h = Number(headers['anthropic-ratelimit-unified-5h-reset'] || 0);
-    const reset7d = Number(headers['anthropic-ratelimit-unified-7d-reset'] || 0);
+    // `?? previous` — not `|| 0`. A header that is present and reads "0" is a real
+    // zero and must land; one that is absent must leave the previous value alone.
+    const keep = (key, prev, parse) =>
+      headers[key] !== undefined ? parse(headers[key]) : (prev ?? 0);
+    const u5h = keep('anthropic-ratelimit-unified-5h-utilization', known?.utilization5h, parseFloat);
+    const u7d = keep('anthropic-ratelimit-unified-7d-utilization', known?.utilization7d, parseFloat);
+    const reset5h = keep('anthropic-ratelimit-unified-5h-reset', known?.resetAt, Number);
+    const reset7d = keep('anthropic-ratelimit-unified-7d-reset', known?.resetAt7d, Number);
+    // Preserve a still-active hard cooldown set by markLimited() from a real 429.
+    // The unified-status header reflects only the account-wide/probe model (the
+    // health probe uses Haiku), so an 'allowed' here does NOT mean a PER-MODEL
+    // limit (e.g. the weekly Opus cap) has lifted. Blindly resetting retryAfter to
+    // 0 on every 200 let the Haiku probe wipe the Opus cooldown, so `priority`
+    // kept re-electing the account and hitting 429 on every request. A real 429's
+    // explicit retry-after outranks a probe until it expires.
+    const prev = state.get(token) || {};
+    const now = Date.now();
+    const activeCooldown = prev.retryAfter && prev.retryAfter > now ? prev.retryAfter : 0;
+    // A plan-limit probe cannot test the separate third-party Extra Usage
+    // allowance. Keep that marker after its short retry cooldown expires; a
+    // real model response (which does not opt in here) is the evidence that can
+    // clear it.
+    const retainExtraUsageMarker = preserveExtraUsageMarker && prev.blockKind === 'extra-usage';
     state.set(token, {
       name,
-      limited: status === 'limited',
+      limited: status === 'limited' || activeCooldown > 0,
       expired: false,
+      // A successful probe can refresh plan-window readings while a separate
+      // per-account cooldown is still active (for example Extra Usage).
+      blockKind: activeCooldown > 0
+        ? (prev.blockKind || null)
+        : (retainExtraUsageMarker ? 'extra-usage' : null),
       resetAt: reset5h,
       resetAt7d: reset7d,
-      retryAfter: 0,
+      retryAfter: activeCooldown,
       utilization5h: u5h,
       utilization7d: u7d,
-      updatedAt: Date.now(),
+      updatedAt: now,
     });
   }
 
-  function markLimited(token, name, retryAfterSec = 0) {
+  /**
+   * Seed the live state from a reading that was persisted to disk.
+   *
+   * This state is keyed by access token and starts empty on every restart, while
+   * the durable copy is keyed by fingerprint — so without a bridge, the first
+   * response after a restart has nothing to preserve against, and any field it
+   * omits lands as 0. That is how a 100%-used account showed 0% until it happened
+   * to receive a response carrying full headers, which a blocked account never
+   * does.
+   *
+   * `updatedAt` comes from the snapshot, not from now: the reading is exactly as
+   * old as it was on disk, and callers use its age to decide when to re-probe.
+   */
+  function hydrate(token, name, snapshot) {
+    if (!token || !snapshot) return;
+    state.set(token, {
+      name,
+      limited: !!snapshot.limited,
+      expired: false,
+      blockKind: snapshot.blockKind || null,
+      resetAt: snapshot.resetAt || 0,
+      resetAt7d: snapshot.resetAt7d || 0,
+      retryAfter: snapshot.retryAfter || 0,
+      utilization5h: snapshot.utilization5h || 0,
+      utilization7d: snapshot.utilization7d || 0,
+      updatedAt: snapshot.updatedAt || 0,
+    });
+  }
+
+  function markLimited(token, name, retryAfterSec = 0, blockKind = null) {
     const prev = state.get(token) || {};
     state.set(token, {
       ...prev, name, limited: true,
+      blockKind: blockKind ?? prev.blockKind ?? null,
       retryAfter: retryAfterSec ? Date.now() + retryAfterSec * 1000 : prev.retryAfter || 0,
       updatedAt: Date.now(),
     });
@@ -113,7 +210,7 @@ export function createAccountStateManager() {
   function clearBillingCooldown(token) {
     const prev = state.get(token);
     if (prev && prev.retryAfter > 0) {
-      state.set(token, { ...prev, retryAfter: 0, updatedAt: Date.now() });
+      state.set(token, { ...prev, retryAfter: 0, blockKind: null, updatedAt: Date.now() });
     }
   }
 
@@ -133,7 +230,7 @@ export function createAccountStateManager() {
     state.delete(token);
   }
 
-  return { update, markLimited, markExpired, clearBillingCooldown, get, entries, clear, remove };
+  return { update, hydrate, markLimited, markExpired, clearBillingCooldown, get, entries, clear, remove };
 }
 
 // ─────────────────────────────────────────────────
@@ -254,6 +351,124 @@ export function createBalanceLimiter({ now = () => Date.now(), setTimer = setTim
 }
 
 // ─────────────────────────────────────────────────
+// Usage caps
+// ─────────────────────────────────────────────────
+
+/**
+ * Reset-aware utilization for one window.
+ *
+ * `utilization5h/7d` is whatever the last response header or probe reported. Once
+ * the window's reset epoch has passed that number is stale by definition — the
+ * window rolled over and usage restarted at zero. Reading it literally would keep
+ * a capped account capped forever: it can't earn a fresh sample while it is being
+ * skipped, so the stale value would be self-perpetuating.
+ *
+ * @param {object|undefined} acctState - entry from the account state manager
+ * @param {'5h'|'7d'} window
+ * @param {number} [now]
+ * @returns {number} utilization on a 0..1 scale
+ */
+export function effectiveUtilization(acctState, window, now = Date.now()) {
+  if (!acctState) return 0;
+  const nowSec = Math.floor(now / 1000);
+  if (window === '5h') {
+    if (acctState.resetAt && acctState.resetAt < nowSec) return 0;
+    return acctState.utilization5h || 0;
+  }
+  if (acctState.resetAt7d && acctState.resetAt7d < nowSec) return 0;
+  return acctState.utilization7d || 0;
+}
+
+/**
+ * Normalize a user-entered cap percentage to the 0..1 scale used by utilization.
+ *
+ * Anything outside (0, 100) means "no cap": 100 is what Anthropic already enforces,
+ * and 0 would mean "never use this account" — which is what the `.disabled` sidecar
+ * is for, and conflating the two would make an empty input silently mute an account.
+ *
+ * @returns {number|null} 0..1, or null when no cap applies
+ */
+export function normalizeCapPercent(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return null;
+  if (n <= 0 || n >= 100) return null;
+  return n / 100;
+}
+
+/**
+ * Resolve the caps in force for one account: a per-account override wins over the
+ * global setting, field by field, so an account can cap only its weekly window and
+ * inherit the global 5h cap.
+ *
+ * @param {object|null} own    - per-account override, e.g. { fiveH: 40, sevenD: null }
+ * @param {object|null} global - global caps, same shape, in percent
+ * @returns {{fiveH: number|null, sevenD: number|null}} on the 0..1 scale
+ */
+export function resolveAccountCaps(own, global) {
+  const pick = (k) => {
+    const v = own?.[k];
+    if (v === null || v === undefined || v === '') return normalizeCapPercent(global?.[k]);
+    return normalizeCapPercent(v);
+  };
+  return { fiveH: pick('fiveH'), sevenD: pick('sevenD') };
+}
+
+/**
+ * Is this account past a cap the user set?
+ *
+ * Reads the caps already resolved onto the account object (`capFiveH` / `capSevenD`,
+ * 0..1 or null) — the same shape as `priority` and `disabled`, resolved once by the
+ * loader rather than threaded through every picker signature.
+ */
+export function isOverUsageCap(account, stateManager, now = Date.now()) {
+  const c5 = account?.capFiveH ?? null;
+  const c7 = account?.capSevenD ?? null;
+  if (c5 === null && c7 === null) return false;
+  const acctState = stateManager.get(account.token);
+  if (c5 !== null && effectiveUtilization(acctState, '5h', now) >= c5) return true;
+  if (c7 !== null && effectiveUtilization(acctState, '7d', now) >= c7) return true;
+  return false;
+}
+
+/**
+ * Which caps this account is currently over, and when it comes back — the window
+ * reset epoch of whichever capped window frees up last.
+ *
+ * Returns `freeAt: 0` when a capped window has no known reset time, so callers can
+ * tell "back at 03:10" apart from "no idea when".
+ *
+ * @returns {{over5h: boolean, over7d: boolean, over: boolean, freeAt: number}} freeAt in ms
+ */
+export function usageCapState(account, stateManager, now = Date.now()) {
+  const c5 = account?.capFiveH ?? null;
+  const c7 = account?.capSevenD ?? null;
+  const acctState = stateManager.get(account?.token);
+  const over5h = c5 !== null && effectiveUtilization(acctState, '5h', now) >= c5;
+  const over7d = c7 !== null && effectiveUtilization(acctState, '7d', now) >= c7;
+  let freeAt = 0;
+  if (over5h || over7d) {
+    const resets = [];
+    if (over5h) resets.push((acctState?.resetAt || 0) * 1000);
+    if (over7d) resets.push((acctState?.resetAt7d || 0) * 1000);
+    // Unknown reset (0) poisons the answer: we can't promise a time we don't have.
+    freeAt = resets.some(r => !r) ? 0 : Math.max(...resets);
+  }
+  return { over5h, over7d, over: over5h || over7d, freeAt };
+}
+
+/**
+ * The one predicate every picker filters on. Kept in one place so a new exclusion
+ * reason can't be added to five filters and forgotten in the sixth.
+ */
+export function isSelectableAccount(a, stateManager, excludeTokens = new Set(), now = Date.now()) {
+  return !excludeTokens.has(a.token)
+    && !a.disabled
+    && isAccountAvailable(a.token, a.expiresAt, stateManager, now)
+    && !isOverUsageCap(a, stateManager, now);
+}
+
+// ─────────────────────────────────────────────────
 // Account availability & selection
 // ─────────────────────────────────────────────────
 
@@ -282,7 +497,7 @@ export function scoreAccount(token, stateManager) {
 
 export function pickBestAccount(accounts, stateManager, excludeTokens = new Set()) {
   const candidates = accounts
-    .filter(a => !excludeTokens.has(a.token) && isAccountAvailable(a.token, a.expiresAt, stateManager))
+    .filter(a => isSelectableAccount(a, stateManager, excludeTokens))
     .map(a => ({ ...a, score: scoreAccount(a.token, stateManager) }))
     .sort((a, b) => a.score - b.score);
   return candidates[0] || null;
@@ -290,7 +505,7 @@ export function pickBestAccount(accounts, stateManager, excludeTokens = new Set(
 
 export function pickDrainFirst(accounts, stateManager, excludeTokens = new Set()) {
   const candidates = accounts
-    .filter(a => !excludeTokens.has(a.token) && isAccountAvailable(a.token, a.expiresAt, stateManager))
+    .filter(a => isSelectableAccount(a, stateManager, excludeTokens))
     .map(a => ({ ...a, score: scoreAccount(a.token, stateManager) }))
     .sort((a, b) => b.score - a.score); // highest utilization first
   return candidates[0] || null;
@@ -314,14 +529,64 @@ export function scoreAccountConserve(token, stateManager) {
 
 export function pickConserve(accounts, stateManager, excludeTokens = new Set()) {
   const candidates = accounts
-    .filter(a => !excludeTokens.has(a.token) && isAccountAvailable(a.token, a.expiresAt, stateManager))
+    .filter(a => isSelectableAccount(a, stateManager, excludeTokens))
     .map(a => ({ ...a, score: scoreAccountConserve(a.token, stateManager) }))
     .sort((a, b) => b.score - a.score); // highest combined utilization first
   return candidates[0] || null;
 }
 
-export function pickAnyUntried(accounts, excludeTokens) {
-  return accounts.find(a => !excludeTokens.has(a.token)) || null;
+/**
+ * Last-resort pick: try an account even if state says it's limited, in case that
+ * state is stale.
+ *
+ * Skips user-disabled accounts and accounts over their usage cap. Both are explicit
+ * user decisions, and they outrank a guess about stale state — a cap that the
+ * last-resort path walks straight through would never actually hold anything back.
+ * `stateManager` is optional so the older two-argument call still works, but without
+ * it the cap can't be evaluated and won't be enforced.
+ */
+export function pickAnyUntried(accounts, excludeTokens, stateManager = null, now = Date.now()) {
+  return accounts.find(a =>
+    !excludeTokens.has(a.token)
+    && !a.disabled
+    && !(stateManager && isOverUsageCap(a, stateManager, now))
+  ) || null;
+}
+
+/**
+ * Priority of an account for the `priority` (failover) strategy.
+ * Higher number = more preferred. Unset / non-numeric defaults to 0.
+ */
+export function accountPriority(account) {
+  const p = account?.priority;
+  return Number.isFinite(p) ? p : 0;
+}
+
+/**
+ * Pick the highest-priority available account (`priority` / failover strategy).
+ *
+ * Among available (not limited/expired/cooling-down), non-excluded accounts,
+ * returns the one with the highest `priority`, tie-broken by lowest 5h
+ * utilization and then account name (for deterministic ordering). Because it
+ * always returns the globally most-preferred available account, a higher-priority
+ * account that comes back online is picked up automatically on the next request.
+ * Returns null when no account is available.
+ *
+ * @param {Array}  accounts      - account objects { name, token, expiresAt, priority? }
+ * @param {object} stateManager  - account state manager
+ * @param {Set}    excludeTokens - tokens to skip (already tried this request)
+ * @param {number} [now]         - current time (for testing cooldown windows)
+ */
+export function pickByPriority(accounts, stateManager, excludeTokens = new Set(), now = Date.now()) {
+  const candidates = accounts
+    .filter(a => isSelectableAccount(a, stateManager, excludeTokens, now))
+    .map(a => ({ ...a, prio: accountPriority(a), score: scoreAccount(a.token, stateManager) }))
+    .sort((a, b) =>
+      (b.prio - a.prio) ||           // higher priority first
+      (a.score - b.score) ||         // then lowest 5h utilization
+      (a.name < b.name ? -1 : a.name > b.name ? 1 : 0) // then name, for determinism
+    );
+  return candidates[0] || null;
 }
 
 /**
@@ -343,7 +608,7 @@ export function pickAnyUntried(accounts, excludeTokens) {
  */
 export function pickLeastLoaded(accounts, inflightTracker, stateManager, cap, excludeTokens = new Set(), now = Date.now()) {
   const candidates = accounts
-    .filter(a => !excludeTokens.has(a.token) && isAccountAvailable(a.token, a.expiresAt, stateManager, now))
+    .filter(a => isSelectableAccount(a, stateManager, excludeTokens, now))
     .map(a => ({
       account: a,
       inflight: inflightTracker.get(a.name),
@@ -367,6 +632,7 @@ export const ROTATION_STRATEGIES = {
   spread:        { label: 'Spread',        desc: 'Always pick lowest utilization (switches often)' },
   'drain-first': { label: 'Drain first',   desc: 'Use highest 5hr-utilization account first' },
   balance:       { label: 'Balance',       desc: 'Spread concurrent requests across accounts, capped per account' },
+  priority:      { label: 'Priority',      desc: 'Prefer your highest-priority account; fail over on limit, switch back when it recovers' },
 };
 
 export const ROTATION_INTERVALS = [15, 30, 60, 120]; // minutes
@@ -376,7 +642,7 @@ export const ROTATION_INTERVALS = [15, 30, 60, 120]; // minutes
  * Returns null if the current account should be kept (sticky / timer not elapsed).
  *
  * @param {object} opts
- * @param {string} opts.strategy - 'sticky' | 'conserve' | 'round-robin' | 'spread' | 'drain-first'
+ * @param {string} opts.strategy - 'sticky' | 'conserve' | 'round-robin' | 'spread' | 'drain-first' | 'priority'
  * @param {number} opts.intervalMin - rotation interval in minutes (for round-robin)
  * @param {string|null} opts.currentToken - token currently in the keychain
  * @param {number} opts.lastRotationTime - timestamp of last proactive rotation
@@ -393,14 +659,20 @@ export function pickByStrategy(opts) {
     now = Date.now(),
   } = opts;
 
-  // For all strategies: if current account is unavailable, always pick a replacement
+  // For all strategies: if current account is unavailable, always pick a replacement.
+  // Being over its usage cap counts as unavailable, so even `sticky` moves off an
+  // account that has hit the ceiling instead of sitting on it.
   const currentAcct = accounts.find(a => a.token === currentToken);
   const currentAvailable = currentToken && currentAcct &&
-    isAccountAvailable(currentToken, currentAcct.expiresAt, stateManager, now);
+    isAccountAvailable(currentToken, currentAcct.expiresAt, stateManager, now) &&
+    !isOverUsageCap(currentAcct, stateManager, now);
 
   if (!currentAvailable) {
-    // Must switch  - pick lowest utilization as safe default
-    const best = pickBestAccount(accounts, stateManager, excludeTokens);
+    // Must switch  - pick a replacement. Honor the priority ordering when that
+    // strategy is active, otherwise fall back to lowest utilization as a safe default.
+    const best = strategy === 'priority'
+      ? pickByPriority(accounts, stateManager, excludeTokens, now)
+      : pickBestAccount(accounts, stateManager, excludeTokens);
     return { account: best, rotated: !!best };
   }
 
@@ -448,6 +720,16 @@ export function pickByStrategy(opts) {
       return { account: null, rotated: false };
     }
 
+    case 'priority': {
+      // Always run on the highest-priority available account. When the current
+      // account is available but a more-preferred one has recovered, switch up.
+      const preferred = pickByPriority(accounts, stateManager, excludeTokens, now);
+      if (preferred && preferred.token !== currentToken) {
+        return { account: preferred, rotated: true };
+      }
+      return { account: null, rotated: false };
+    }
+
     default:
       return { account: null, rotated: false };
   }
@@ -473,6 +755,21 @@ export function getEarliestReset(stateManager) {
   if (earliest === Infinity) return 'unknown';
   const d = new Date(earliest * 1000);
   return d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+}
+
+/**
+ * A wait, in the units a human reads it in. Seconds stop being readable somewhere
+ * around a minute, and a hold can now run for a day — "waiting up to 86400s" is a
+ * number you have to do arithmetic on before you know what the daemon is doing.
+ */
+export function formatDuration(ms) {
+  const sec = Math.max(0, Math.round(ms / 1000));
+  if (sec < 90) return `${sec}s`;
+  const min = Math.round(sec / 60);
+  if (min < 90) return `${min}min`;
+  const hours = ms / 3_600_000;
+  const rounded = Math.round(hours * 10) / 10;
+  return `${Number.isInteger(rounded) ? rounded : rounded.toFixed(1)}h`;
 }
 
 // ─────────────────────────────────────────────────
@@ -525,6 +822,150 @@ export function createProbeTracker(maxAge = PROBE_LOG_MAX_AGE) {
 
 // Re-export constants for tests
 export { PROBE_INPUT_TOKENS, PROBE_OUTPUT_TOKENS, PROBE_LOG_MAX_AGE };
+
+// ─────────────────────────────────────────────────
+// Usage attribution & list pricing
+// ─────────────────────────────────────────────────
+
+// List price per million tokens, USD. Cache reads are ~0.1x input and cache
+// writes ~1.25x input (5-minute TTL) — for a Claude Code session, where each turn
+// re-reads the whole context as a cache read, ignoring them understates real
+// consumption by roughly an order of magnitude.
+export const MODEL_PRICING_USD = {
+  'claude-fable-5':  { input: 10, output: 50 },
+  'claude-mythos-5': { input: 10, output: 50 },
+  'claude-opus-5':   { input: 5,  output: 25 },
+  'claude-opus-4-8': { input: 5,  output: 25 },
+  'claude-opus-4-7': { input: 5,  output: 25 },
+  'claude-opus-4-6': { input: 5,  output: 25 },
+  'claude-opus-4-5': { input: 5,  output: 25 },
+  'claude-sonnet-5': { input: 3,  output: 15 },
+  'claude-sonnet-4-6': { input: 3, output: 15 },
+  'claude-sonnet-4-5': { input: 3, output: 15 },
+  'claude-haiku-4-5':  { input: 1, output: 5 },
+};
+const MODEL_PRICING_DEFAULT = { input: 5, output: 25 };
+const CACHE_READ_MULTIPLIER = 0.1;
+const CACHE_WRITE_MULTIPLIER = 1.25;
+
+export function pricingFor(model) {
+  if (!model) return MODEL_PRICING_DEFAULT;
+  // Longest prefix wins, so `claude-opus-4-8` isn't matched by a shorter key.
+  let best = null;
+  for (const key of Object.keys(MODEL_PRICING_USD)) {
+    if (model.startsWith(key) && (!best || key.length > best.length)) best = key;
+  }
+  return best ? MODEL_PRICING_USD[best] : MODEL_PRICING_DEFAULT;
+}
+
+/** Every token the account was charged for, cache included. */
+export function billableTokens(r) {
+  return (r.inputTokens || 0) + (r.outputTokens || 0)
+    + (r.cacheReadTokens || 0) + (r.cacheCreationTokens || 0);
+}
+
+/**
+ * What this traffic would have cost at API list prices, in USD.
+ *
+ * This is NOT what the account actually costs — these are subscription accounts,
+ * billed at a flat monthly rate. Read it as "the value I pulled out of the
+ * subscription this window", which is the useful comparison, and label it that
+ * way anywhere it's shown.
+ */
+export function listCostUsd(r) {
+  const p = pricingFor(r.model);
+  return ((r.inputTokens || 0) / 1e6) * p.input
+    + ((r.outputTokens || 0) / 1e6) * p.output
+    + ((r.cacheReadTokens || 0) / 1e6) * p.input * CACHE_READ_MULTIPLIER
+    + ((r.cacheCreationTokens || 0) / 1e6) * p.input * CACHE_WRITE_MULTIPLIER;
+}
+
+export const ATTRIBUTION_BANDS = 40; // slices per window — enough to read, cheap to draw
+
+/**
+ * Build the chronological picture for one account and one window.
+ *
+ * Returns per-slice: my measured tokens, my list-price value, and — where
+ * utilization samples cover the slice — how much of the window's utilization rise
+ * happened in it and whether this proxy was responsible.
+ */
+export function attributionForWindow(records, samples, { from, to, key }) {
+  const span = to - from;
+  const width = span / ATTRIBUTION_BANDS;
+  const bands = Array.from({ length: ATTRIBUTION_BANDS }, (_, i) => ({
+    from: from + i * width,
+    to: from + (i + 1) * width,
+    myTokens: 0,
+    myCostUsd: 0,
+    requests: 0,
+    deltaUtil: null,   // null = no utilization samples cover this slice
+  }));
+
+  let myTokens = 0, myCostUsd = 0, requests = 0;
+  // Keep the four token classes separate as well as exposing their billable
+  // total. A large cache-read total is normal for a long coding session, but a
+  // bare total makes it look as if a new account somehow arrived pre-spent.
+  const tokenBreakdown = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+  };
+  const byModel = {};
+  for (const r of records) {
+    if (r.ts < from || r.ts > to) continue;
+    const tok = billableTokens(r);
+    const cost = listCostUsd(r);
+    myTokens += tok; myCostUsd += cost; requests++;
+    tokenBreakdown.inputTokens += r.inputTokens || 0;
+    tokenBreakdown.outputTokens += r.outputTokens || 0;
+    tokenBreakdown.cacheReadTokens += r.cacheReadTokens || 0;
+    tokenBreakdown.cacheCreationTokens += r.cacheCreationTokens || 0;
+    const m = byModel[r.model || 'unknown'] || (byModel[r.model || 'unknown'] = { tokens: 0, costUsd: 0, requests: 0 });
+    m.tokens += tok; m.costUsd += cost; m.requests++;
+    const idx = Math.min(ATTRIBUTION_BANDS - 1, Math.floor((r.ts - from) / width));
+    bands[idx].myTokens += tok;
+    bands[idx].myCostUsd += cost;
+    bands[idx].requests++;
+  }
+
+  // Attribute utilization rises to slices. A drop means the window rolled over
+  // mid-sample; treat it as zero rather than as negative external usage.
+  let covered = 0;
+  const inWindow = samples.filter(s => s.ts >= from && s.ts <= to).sort((a, b) => a.ts - b.ts);
+  for (let i = 1; i < inWindow.length; i++) {
+    const prev = inWindow[i - 1], cur = inWindow[i];
+    const rise = Math.max(0, (cur[key] || 0) - (prev[key] || 0));
+    const idx = Math.min(ATTRIBUTION_BANDS - 1, Math.floor((cur.ts - from) / width));
+    bands[idx].deltaUtil = (bands[idx].deltaUtil || 0) + rise;
+  }
+  for (const b of bands) if (b.deltaUtil !== null) covered++;
+
+  // Split the measured rise: a slice where utilization climbed with no traffic
+  // through this proxy is someone else on the account.
+  let riseMine = 0, riseExternal = 0;
+  for (const b of bands) {
+    if (b.deltaUtil === null || b.deltaUtil === 0) continue;
+    if (b.myTokens > 0) riseMine += b.deltaUtil;
+    else riseExternal += b.deltaUtil;
+  }
+  const riseTotal = riseMine + riseExternal;
+
+  return {
+    myTokens,
+    myCostUsd,
+    requests,
+    tokenBreakdown,
+    byModel,
+    bands,
+    // Coverage is what keeps this honest: with few samples the split below is
+    // computed from a sliver of the window, and the UI says so instead of
+    // presenting it as the whole picture.
+    coverage: covered / ATTRIBUTION_BANDS,
+    measuredRise: riseTotal,
+    externalShare: riseTotal > 0 ? riseExternal / riseTotal : null,
+  };
+}
 
 // ─────────────────────────────────────────────────
 // Utilization history (for sparklines & velocity)

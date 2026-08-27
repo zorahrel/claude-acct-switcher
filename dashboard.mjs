@@ -4,12 +4,17 @@
 
 import { createServer } from 'node:http';
 import { readdir, readFile, writeFile, mkdir, unlink, chmod, rename } from 'node:fs/promises';
-import { join, basename } from 'node:path';
-import { execSync } from 'node:child_process';
+import { join, basename, isAbsolute } from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
-import { existsSync, writeFileSync, mkdirSync, readdirSync, readFileSync, unlinkSync, renameSync } from 'node:fs';
-import { Transform } from 'node:stream';
+import { existsSync, writeFileSync, mkdirSync, readdirSync, readFileSync, unlinkSync, renameSync, readlinkSync } from 'node:fs';
+import { Transform, PassThrough } from 'node:stream';
+import {
+  IS_WINDOWS, HOME, currentUser, credentialStoreLabel,
+  readCredentials, writeCredentials, safeCredentialError,
+  notifyDesktop, sleepSync, makeExecutable,
+} from './platform.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -20,30 +25,455 @@ process.stdout?.on?.('error', () => {});
 process.stderr?.on?.('error', () => {});
 
 const PORT = parseInt(process.env.CSW_PORT || '3333', 10);
+// Bind su loopback: la dashboard mostra gli account e il proxy inoltra i TUOI
+// token Anthropic. In ascolto su 0.0.0.0 chiunque sia sulla stessa rete
+// (bar, coworking, hotel) puo' usare il tuo abbonamento senza autenticarsi.
+const HOST = process.env.CSW_HOST || '127.0.0.1';
 const ACCOUNTS_DIR = join(__dirname, 'accounts');
-const STATS_CACHE = join(process.env.HOME, '.claude', 'stats-cache.json');
+const STATS_CACHE = join(HOME, '.claude', 'stats-cache.json');
 const CONFIG_FILE = join(__dirname, 'config.json');
 const STATE_FILE = join(__dirname, 'account-state.json');
 const TOKEN_USAGE_FILE = join(__dirname, 'token-usage.json');
 const SESSION_HISTORY_FILE = join(__dirname, 'session-history.json');
-const KEYCHAIN_ACCOUNT = process.env.USER || execSync('whoami').toString().trim();
+const KEYCHAIN_ACCOUNT = currentUser();
 
 // Detect installed Claude Code version for User-Agent mimicry
 function detectClaudeCodeVersion() {
   try {
-    const out = execSync('claude --version 2>/dev/null', { encoding: 'utf8', timeout: 3000 }).trim();
+    // execFileSync, not execSync: `2>/dev/null` is meaningless to cmd.exe, and
+    // `claude` resolves to a .cmd shim on Windows that needs shell resolution.
+    const out = execFileSync('claude', ['--version'], {
+      encoding: 'utf8', timeout: 3000, stdio: ['pipe', 'pipe', 'pipe'], shell: IS_WINDOWS,
+    }).trim();
     const match = out.match(/^([\d.]+)/);
     if (match) return match[1];
   } catch {}
-  // Fallback: read symlink target which contains the version
+  // Fallback: the install path carries the version. On macOS that means reading
+  // a symlink; on Windows there is no symlink to read, so the versions
+  // directory is listed instead.
   try {
-    const target = execSync('readlink ~/.local/bin/claude 2>/dev/null || readlink /usr/local/bin/claude 2>/dev/null', { encoding: 'utf8', timeout: 2000 }).trim();
-    const match = target.match(/versions\/([\d.]+)/);
-    if (match) return match[1];
+    for (const p of [join(HOME, '.local', 'bin', 'claude'), '/usr/local/bin/claude']) {
+      try {
+        const match = readlinkSync(p).match(/versions[\/\\]([\d.]+)/);
+        if (match) return match[1];
+      } catch { /* not a symlink, or absent */ }
+    }
+  } catch {}
+  try {
+    const versionsDir = join(HOME, '.local', 'share', 'claude', 'versions');
+    const newest = readdirSync(versionsDir)
+      .filter(v => /^[\d.]+$/.test(v))
+      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
+      .pop();
+    if (newest) return newest;
   } catch {}
   return '2.1.0'; // safe default
 }
 const CLAUDE_CODE_VERSION = detectClaudeCodeVersion();
+
+// ── OpenAI-compatible route → native Messages wire ──
+//
+// `/chat/completions` cannot express what Anthropic requires: the Claude Code
+// identity has to be the FIRST system block, standing ALONE. On that route a
+// second system message is merged into the first upstream, and appending to the
+// identity breaks it too — both measured as 429. Only the native `system` ARRAY
+// keeps the blocks separate, so a caller that speaks OpenAI (jcode's named
+// provider) is translated onto /v1/messages and translated back on the way out.
+//
+// Measured 2026-08-17, account at 0% of its 5h window (so quota is not the
+// variable): /chat/completions with jcode's own system → 429, the same request
+// as /v1/messages with system:[CC, jcode] → 200, and the jcode instructions were
+// obeyed (answer in Italian, ending with the requested marker).
+const OPENAI_ROUTE_RE = /\/(?:v1\/)?chat\/completions/;
+
+// ── Reserved `mcp_*` tool names ──
+//
+// Anthropic reserves the `mcp_` prefix for its own MCP connector tools and
+// rejects a request whose tool list declares one. The rejection is a `400
+// invalid_request_error` reading "You're out of extra usage. Add more at
+// claude.ai/settings/usage" — a billing message for a schema problem, which is
+// why this looked like an exhausted account for a whole day while the same
+// token answered 200 on the very next request.
+//
+// Measured 2026-08-24, same token and same second, one tool each:
+//   mcp_call / mcp_search / mcp_x / mcp_a / mcp_call_x  → 400
+//   mcp / mcpfoo / mcpcall / mcp-call / MCP_call        → 200
+//   mcp__gateway__x / mcp_ / mcp_1 / jcode_mcp_call     → 200
+// So the rejected shape is `mcp_` + a letter, and NOT the MCP connector's own
+// `mcp__server__tool` double-underscore form, which must keep passing through.
+//
+// jcode ships exactly two such tools (`mcp_call`, `mcp_search`), so on this
+// route every request it makes with its full toolset failed. We rename them on
+// the way out and restore the original name on the way back, in all three
+// places a name can appear: the JSON response, the SSE stream, and the caller's
+// own transcript of earlier tool calls.
+const RESERVED_TOOL_PREFIX_RE = /^mcp_(?!_)[A-Za-z]/;
+const TOOL_ALIAS_PREFIX = 'vdmt_';
+
+function isReservedToolName(name) {
+  return typeof name === 'string' && RESERVED_TOOL_PREFIX_RE.test(name);
+}
+
+/** Upstream-safe name for a tool Anthropic would reject. Identity otherwise. */
+function aliasToolName(name) {
+  return isReservedToolName(name) ? TOOL_ALIAS_PREFIX + name : name;
+}
+
+/** Inverse of aliasToolName: only undoes a prefix this proxy added. */
+function unaliasToolName(name) {
+  return typeof name === 'string' && name.startsWith(TOOL_ALIAS_PREFIX)
+    ? name.slice(TOOL_ALIAS_PREFIX.length)
+    : name;
+}
+
+// The native Messages route normally keeps its payload untouched. That means a
+// client which accidentally declares `mcp_call` / `mcp_search` can still receive
+// Anthropic's deliberately misleading "out of extra usage" 400. It is a schema
+// rejection, not evidence that another account will help. Detect only the known
+// offending shapes so genuine extra-usage exhaustion retains its failover path.
+function requestHasReservedMcpToolName(body) {
+  if (!body?.length) return false;
+  try {
+    const request = JSON.parse(body.toString('utf8'));
+    if (!request || typeof request !== 'object') return false;
+    if (Array.isArray(request.tools) && request.tools.some(tool => isReservedToolName(tool?.name))) return true;
+    if (isReservedToolName(request.tool_choice?.name)) return true;
+    return Array.isArray(request.messages) && request.messages.some(message =>
+      Array.isArray(message?.content) && message.content.some(block =>
+        block?.type === 'tool_use' && isReservedToolName(block.name)
+      )
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isOpenClawRequest(body) {
+  if (!body?.length) return false;
+  try {
+    const request = JSON.parse(body.toString('utf8'));
+    const system = request?.system;
+    const systemText = typeof system === 'string'
+      ? system
+      : Array.isArray(system)
+        ? system.map(block => typeof block === 'string' ? block : block?.text || '').join('\n')
+        : '';
+    const cwd = systemText.match(/working directory:\s*(.+)/i)?.[1]?.trim().split('\n')[0].trim() || '';
+    return cwd === '.openclaw' || cwd.endsWith('/.openclaw') || cwd.includes('/.openclaw/');
+  } catch {
+    return false;
+  }
+}
+
+function isReservedMcpSchemaError(errorType, errorMessage, body) {
+  return errorType === 'invalid_request_error'
+    && /(?:out of )?extra usage/i.test(errorMessage || '')
+    && requestHasReservedMcpToolName(body);
+}
+
+function isOpenClawExtraUsageError(errorType, errorMessage, body) {
+  return errorType === 'invalid_request_error'
+    && /(?:out of )?extra usage/i.test(errorMessage || '')
+    && isOpenClawRequest(body);
+}
+
+/** OpenAI chat body → Messages body. Returns null when it should not be touched. */
+function openaiToMessages(parsed) {
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.messages)) return null;
+
+  const systemBlocks = [{ type: 'text', text: CLAUDE_CODE_SYSTEM_PROMPT }];
+  const messages = [];
+  for (const m of parsed.messages) {
+    const content = typeof m?.content === 'string'
+      ? m.content
+      : Array.isArray(m?.content)
+        ? m.content.map(b => (typeof b === 'string' ? b : b?.text || '')).join('')
+        : '';
+    if (m?.role === 'system') {
+      // The caller's own system prompt keeps full system authority as its own
+      // block — measured obeyed. Skip a duplicate identity.
+      if (content && content !== CLAUDE_CODE_SYSTEM_PROMPT) {
+        systemBlocks.push({ type: 'text', text: content });
+      }
+    } else if (m?.role === 'tool') {
+      // A tool result. Anthropic carries it as a user turn holding tool_result
+      // blocks; merge consecutive results into one turn, as the API expects.
+      const block = { type: 'tool_result', tool_use_id: m.tool_call_id, content: content };
+      const prev = messages[messages.length - 1];
+      if (prev && prev.role === 'user' && Array.isArray(prev.content) && prev.content[0]?.type === 'tool_result') {
+        prev.content.push(block);
+      } else {
+        messages.push({ role: 'user', content: [block] });
+      }
+    } else if (m?.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      // An assistant turn that called tools: text first, then one tool_use per call.
+      const blocks = [];
+      if (content) blocks.push({ type: 'text', text: content });
+      for (const tc of m.tool_calls) {
+        let input = {};
+        try { input = JSON.parse(tc.function?.arguments || '{}'); } catch { input = {}; }
+        // Same aliasing as the tool definitions below: a transcript that names
+        // `mcp_call` is rejected exactly like a declaration of it, so earlier
+        // turns have to carry the upstream-safe name too.
+        blocks.push({ type: 'tool_use', id: tc.id, name: aliasToolName(tc.function?.name), input });
+      }
+      messages.push({ role: 'assistant', content: blocks });
+    } else if (m?.role === 'assistant' || m?.role === 'user') {
+      messages.push({ role: m.role, content: Array.isArray(m.content) ? m.content : content });
+    }
+  }
+  if (!messages.length) return null; // Messages API requires at least one turn
+
+  // ── Prompt caching ──
+  // Without an explicit cache_control breakpoint Anthropic charges the full
+  // prompt on EVERY turn. Measured on this route: the same 9534-token system
+  // prompt billed 9534 twice in a row, zero cache reads. A cached read costs
+  // ~10% of a fresh one, so leaving this out burns the 5h window roughly ten
+  // times faster — and it would look like "vdm eats my quota", not like a bug.
+  //
+  // The breakpoint goes on the LAST system block: everything before it (the
+  // identity plus the caller's own prompt) is the stable prefix that repeats
+  // turn after turn. Tool definitions sit before the system blocks in the cache
+  // order, so they are covered by the same breakpoint.
+  const lastSystem = systemBlocks[systemBlocks.length - 1];
+  if (lastSystem && typeof lastSystem.text === 'string' && lastSystem.text.length > 200) {
+    lastSystem.cache_control = { type: 'ephemeral' };
+  }
+
+  // Second breakpoint, on the conversation itself. The system prefix alone is
+  // cached by the block above, but in a long session the transcript dwarfs it:
+  // measured on three turns, cache_read stayed pinned at the system size (9226)
+  // while the prompt kept growing (9236 → 9392 → 9604), i.e. the history was
+  // re-read fresh every turn. Marking the last-but-one turn extends the cached
+  // prefix to everything except the newest exchange.
+  //
+  // Last-but-one, not last: the final turn changes on every request, and a
+  // breakpoint there would invalidate the entry each time — writing cache
+  // instead of reading it, which costs more than not caching at all.
+  if (messages.length >= 3) {
+    const anchor = messages[messages.length - 2];
+    if (typeof anchor.content === 'string') {
+      anchor.content = [{ type: 'text', text: anchor.content, cache_control: { type: 'ephemeral' } }];
+    } else if (Array.isArray(anchor.content) && anchor.content.length) {
+      const lastBlock = anchor.content[anchor.content.length - 1];
+      if (lastBlock && typeof lastBlock === 'object') lastBlock.cache_control = { type: 'ephemeral' };
+    }
+  }
+
+  const out = {
+    model: parsed.model,
+    // Required by the Messages API; OpenAI treats it as optional.
+    max_tokens: parsed.max_tokens ?? parsed.max_completion_tokens ?? 8192,
+    system: systemBlocks,
+    messages,
+  };
+  if (parsed.stream) out.stream = true;
+  if (typeof parsed.temperature === 'number') out.temperature = parsed.temperature;
+  if (typeof parsed.top_p === 'number') out.top_p = parsed.top_p;
+  if (parsed.stop) out.stop_sequences = Array.isArray(parsed.stop) ? parsed.stop : [parsed.stop];
+
+  // Tool definitions. Without this the model has no tools and "uses" them by
+  // printing the call as prose — measured: it claimed to have written a file it
+  // never wrote. A wrong answer that looks right is worse than an error.
+  if (Array.isArray(parsed.tools) && parsed.tools.length) {
+    out.tools = parsed.tools
+      .filter(t => t?.function?.name)
+      .map(t => ({
+        // `mcp_*` is reserved upstream and 400s the whole request — see
+        // RESERVED_TOOL_PREFIX_RE. Renamed here, restored on the way back.
+        name: aliasToolName(t.function.name),
+        description: t.function.description || '',
+        input_schema: t.function.parameters || { type: 'object', properties: {} },
+      }));
+  }
+  if (parsed.tool_choice) {
+    const tc = parsed.tool_choice;
+    if (tc === 'auto') out.tool_choice = { type: 'auto' };
+    else if (tc === 'required') out.tool_choice = { type: 'any' };
+    else if (tc === 'none') delete out.tools;
+    else if (tc?.function?.name) out.tool_choice = { type: 'tool', name: aliasToolName(tc.function.name) };
+  }
+  return out;
+}
+
+const STOP_REASON_MAP = { end_turn: 'stop', stop_sequence: 'stop', max_tokens: 'length', tool_use: 'tool_calls' };
+
+/** Messages response → OpenAI chat completion. */
+function messagesToOpenai(msg) {
+  const blocks = msg.content || [];
+  const text = blocks.filter(b => b?.type === 'text').map(b => b.text).join('');
+  const toolCalls = blocks
+    .filter(b => b?.type === 'tool_use')
+    .map((b, i) => ({
+      index: i,
+      id: b.id,
+      type: 'function',
+      // Undo the outbound alias so the caller sees the tool it declared;
+      // a name it does not recognise would be an unroutable tool call.
+      function: { name: unaliasToolName(b.name), arguments: JSON.stringify(b.input ?? {}) },
+    }));
+  const u = msg.usage || {};
+  const message = { role: 'assistant', content: text || null };
+  if (toolCalls.length) message.tool_calls = toolCalls;
+  return {
+    id: msg.id,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: msg.model,
+    choices: [{
+      index: 0,
+      message,
+      finish_reason: STOP_REASON_MAP[msg.stop_reason] || 'stop',
+    }],
+    usage: {
+      // Anthropic bills cache reads/writes separately from fresh input, and
+      // OpenAI's shape has nowhere to put them: reporting only input_tokens
+      // makes a cached turn look 10x cheaper than it is (or, on a write, hides
+      // the extra cost). Report the true total and keep the detail alongside,
+      // in the same shape OpenAI uses for cached prompts.
+      prompt_tokens: (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0),
+      completion_tokens: u.output_tokens || 0,
+      total_tokens: (u.input_tokens || 0) + (u.cache_read_input_tokens || 0)
+        + (u.cache_creation_input_tokens || 0) + (u.output_tokens || 0),
+      prompt_tokens_details: { cached_tokens: u.cache_read_input_tokens || 0 },
+      cache_creation_input_tokens: u.cache_creation_input_tokens || 0,
+      cache_read_input_tokens: u.cache_read_input_tokens || 0,
+    },
+  };
+}
+
+/**
+ * Transform stream: Anthropic SSE → OpenAI SSE.
+ *
+ * Only `text_delta` becomes content. `thinking_delta` is deliberately dropped:
+ * it carries no `text` field, and forwarding it as content would emit an empty
+ * string per chunk — which is exactly the "200 with empty content" symptom seen
+ * when a gateway maps the block types naively.
+ */
+function createOpenaiSseTranslator(model) {
+  const id = 'chatcmpl-' + Math.random().toString(36).slice(2);
+  const created = Math.floor(Date.now() / 1000);
+  const frame = (delta, finish = null) => 'data: ' + JSON.stringify({
+    id, object: 'chat.completion.chunk', created, model,
+    choices: [{ index: 0, delta, finish_reason: finish }],
+  }) + '\n\n';
+
+  let buf = '';
+  let sentRole = false;
+  let inText = false;
+  // Tool calls stream as a `tool_use` block whose arguments arrive in
+  // input_json_delta fragments. OpenAI wants the same fragments under
+  // tool_calls[].function.arguments, keyed by index — so track which block
+  // index is a tool and what position it holds in the tool_calls array.
+  const toolIndexByBlock = new Map();
+  let nextToolIndex = 0;
+  return new Transform({
+    transform(chunk, _enc, cb) {
+      buf += chunk.toString('utf8');
+      // SSE events are \n\n-separated; keep the trailing partial event buffered.
+      const events = buf.split('\n\n');
+      buf = events.pop();
+      for (const ev of events) {
+        const dataLine = ev.split('\n').find(l => l.startsWith('data:'));
+        if (!dataLine) continue;
+        let e;
+        try { e = JSON.parse(dataLine.slice(5).trim()); } catch { continue; }
+
+        if (e.type === 'content_block_start') {
+          const bt = e.content_block?.type;
+          inText = bt === 'text';
+          if (inText && !sentRole) { sentRole = true; this.push(frame({ role: 'assistant' })); }
+          if (bt === 'tool_use') {
+            const idx = nextToolIndex++;
+            toolIndexByBlock.set(e.index, idx);
+            if (!sentRole) { sentRole = true; this.push(frame({ role: 'assistant' })); }
+            // Announce the call with its id and name; arguments follow as deltas.
+            this.push(frame({
+              tool_calls: [{
+                index: idx, id: e.content_block.id, type: 'function',
+                // Streamed name gets the same un-aliasing as the JSON path:
+                // the caller must see the tool name it actually declared.
+                function: { name: unaliasToolName(e.content_block.name), arguments: '' },
+              }],
+            }));
+          }
+        } else if (e.type === 'content_block_delta' && e.delta?.type === 'text_delta') {
+          if (!sentRole) { sentRole = true; this.push(frame({ role: 'assistant' })); }
+          this.push(frame({ content: e.delta.text }));
+        } else if (e.type === 'content_block_delta' && e.delta?.type === 'input_json_delta') {
+          const idx = toolIndexByBlock.get(e.index);
+          if (idx !== undefined) {
+            this.push(frame({
+              tool_calls: [{ index: idx, function: { arguments: e.delta.partial_json || '' } }],
+            }));
+          }
+        } else if (e.type === 'content_block_stop') {
+          inText = false;
+        } else if (e.type === 'message_delta' && e.delta?.stop_reason) {
+          this.push(frame({}, STOP_REASON_MAP[e.delta.stop_reason] || 'stop'));
+        } else if (e.type === 'message_stop') {
+          this.push('data: [DONE]\n\n');
+        } else if (e.type === 'error') {
+          // Surface upstream errors instead of ending the stream silently.
+          this.push('data: ' + JSON.stringify({ error: e.error }) + '\n\n');
+        }
+      }
+      cb();
+    },
+    flush(cb) { cb(); },
+  });
+}
+
+const CLAUDE_CODE_SYSTEM_PROMPT = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+// Give a request the Claude Code identity Anthropic requires to serve an OAuth
+// subscription token — as its own leading system block, byte-identical.
+//
+// Measured 2026-08-17 against the live API, same account and same second:
+//   /chat/completions, no system                         → 429
+//   /chat/completions, system "You are a helpful …"      → 429
+//   /chat/completions, system = CC exactly               → 200
+//   /chat/completions, ONE system = CC + "\n\n## Identity…" → 429
+//   /chat/completions, TWO system messages, CC first     → 429
+//   /v1/messages,      system: [CC block, custom block]  → 200
+//
+// So the identity must stand alone as the first block: appending to it fails, and
+// on /chat/completions a second system message is merged into the first upstream,
+// which also fails. Only the native `system` ARRAY keeps the blocks separate.
+//
+// Why this matters beyond the error: Anthropic returns that rejection as
+// 429 rate_limit_error with NO retry-after header, which is indistinguishable from
+// real exhaustion downstream — retryAfter parses to 0, `0 < 60` classifies it
+// "transient", and the account is never switched. That is why jcode logged eight
+// consecutive 429s on an account that still had quota.
+function ensureClaudeCodeIdentity(url, body) {
+  // /chat/completions cannot express separate system blocks, so it is left alone:
+  // rewriting it onto the Messages wire would also require translating the
+  // response and the SSE stream back, which is a different change with its own
+  // failure modes. Callers that need Opus should use the native route.
+  if (!/\/v1\/messages/.test(url || '') || !body.length) return body;
+  try {
+    const parsed = JSON.parse(body.toString('utf8'));
+    if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.messages)) return body;
+
+    // Normalise `system` to an array of blocks: it may be absent, a string, or
+    // already an array. A string becomes one block so the identity can precede it
+    // instead of being concatenated into it (concatenation is the 429 case above).
+    let blocks;
+    if (Array.isArray(parsed.system)) blocks = [...parsed.system];
+    else if (typeof parsed.system === 'string' && parsed.system) blocks = [{ type: 'text', text: parsed.system }];
+    else if (parsed.system == null) blocks = [];
+    else return body; // unknown shape: do not guess
+
+    const firstText = typeof blocks[0]?.text === 'string' ? blocks[0].text : null;
+    if (firstText === CLAUDE_CODE_SYSTEM_PROMPT) return body; // already correct
+
+    blocks.unshift({ type: 'text', text: CLAUDE_CODE_SYSTEM_PROMPT });
+    return Buffer.from(JSON.stringify({ ...parsed, system: blocks }));
+  } catch {
+    return body; // not JSON: forward untouched
+  }
+}
 
 // Project version — read from .version file (written by vdm upgrade), fall back to git tag
 function detectProjectVersion() {
@@ -53,42 +483,58 @@ function detectProjectVersion() {
     if (v) return v;
   } catch {}
   try {
-    return execSync('git describe --tags --abbrev=0 2>/dev/null', { encoding: 'utf8', cwd: __dirname, timeout: 3000 }).trim();
+    return gitSync(['describe', '--tags', '--abbrev=0'], { cwd: __dirname }) || 'dev';
   } catch {}
   return 'dev';
 }
 const PROJECT_VERSION = detectProjectVersion();
 
-// Auto-detect keychain service name for robustness against Claude Code updates.
-// Falls back to the known default if detection fails.
-function detectKeychainService() {
+// Where the active credentials live differs by platform (Keychain vs
+// ~/.claude/.credentials.json); platform.mjs owns that decision entirely.
+// This label exists only for diagnostics and the /api/proxy-status payload.
+const CREDENTIAL_STORE_LABEL = credentialStoreLabel();
+
+// ─────────────────────────────────────────────────
+// git
+// ─────────────────────────────────────────────────
+
+// Every git call in this file used to be an execSync string ending in
+// `2>/dev/null`. Two things break on Windows: cmd.exe has no /dev/null (it
+// tries to create a file called `\dev\null` and fails the whole command), and
+// a repo path containing a space or an ampersand is re-split by the shell.
+// execFileSync with an argv array has neither problem, and `stdio: pipe`
+// already swallows stderr — which is all the redirect was ever for.
+//
+// Returns the trimmed stdout, or null when git fails (not a repo, no such
+// ref, git missing). Callers must treat null as "unknown", never as an error:
+// running outside a git repo is completely normal here.
+function gitSync(args, { cwd, timeout = 3000 } = {}) {
   try {
-    // Search for any keychain entry matching the Claude Code pattern
-    const out = execSync(
-      `security find-generic-password -a "${KEYCHAIN_ACCOUNT}" -s "Claude Code-credentials" -w 2>/dev/null && echo "Claude Code-credentials"`,
-      { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
-    ).trim();
-    const lines = out.split('\n');
-    return lines[lines.length - 1]; // last line is the service name
+    return execFileSync('git', args, {
+      cwd,
+      encoding: 'utf8',
+      timeout,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    }).trim();
   } catch {
-    // Try a broader search for any "Claude" credential
-    try {
-      const dump = execSync(
-        `security dump-keychain 2>/dev/null | grep -A4 '"svce"' | grep -i claude | head -1`,
-        { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
-      ).trim();
-      const match = dump.match(/"svce"<blob>="([^"]+)"/);
-      if (match) return match[1];
-    } catch {}
+    return null;
   }
-  return 'Claude Code-credentials'; // fallback
 }
 
-const KEYCHAIN_SERVICE = detectKeychainService();
+// `git -C <dir>` for the common case, so no caller has to quote a path.
+function gitIn(cwd, args, opts) {
+  return gitSync(['-C', String(cwd), ...args], opts);
+}
 
 // ─────────────────────────────────────────────────
 // Settings (persisted to config.json)
 // ─────────────────────────────────────────────────
+
+// Ceiling for `usageCapHoldMin`: 24h, one full weekly-window day. Long holds are a
+// deliberate choice — "wait for the window instead of dying" only pays off if the
+// wait may outlast the window. Anything above this is a stall, not a wait.
+const MAX_HOLD_MIN = 24 * 60;
 
 const DEFAULT_SETTINGS = {
   autoSwitch: true,
@@ -102,6 +548,18 @@ const DEFAULT_SETTINGS = {
   balanceWaitMs: 10000,       // balance mode: wait for a freed slot before overflowing
   commitTokenUsage: false,
   sessionMonitor: false,
+  // Usage caps: stop electing an account once it passes this share of a window.
+  // Percentages (1..99) or null for "no cap". Per-account sidecars override these.
+  usageCap5h: null,
+  usageCap7d: null,
+  // When every account is over its cap, hold requests for up to this many minutes
+  // waiting for a window to roll over, instead of failing them straight away.
+  // 0 disables the wait and returns the 429 immediately. Ceiling is MAX_HOLD_MIN.
+  usageCapHoldMin: 10,
+  // USD→EUR rate used to show the list-price value of your own usage in euro.
+  // It is an assumption, not a quote — nothing here fetches an exchange rate, so
+  // it's exposed as a setting rather than baked in where it would silently rot.
+  usdEur: 0.92,
 };
 
 function loadSettings() {
@@ -121,7 +579,22 @@ function clampSettings(s) {
   const n = (v, def, lo, hi) => (typeof v === 'number' && isFinite(v) ? Math.min(Math.max(v, lo), hi) : def);
   s.maxConcurrentPerAccount = Math.floor(n(s.maxConcurrentPerAccount, 8, 1, 50));
   s.balanceWaitMs = n(s.balanceWaitMs, 10000, 0, 30000);
+  // A cap outside 1..99 is meaningless (100 is what Anthropic already enforces, 0
+  // would silently mute the account — that's what disabling it is for), so it reads
+  // as "no cap" rather than being clamped into an accidental limit.
+  s.usageCap5h = sanitizeCapPercent(s.usageCap5h);
+  s.usageCap7d = sanitizeCapPercent(s.usageCap7d);
+  s.usageCapHoldMin = Math.floor(n(s.usageCapHoldMin, 10, 0, MAX_HOLD_MIN));
+  s.usdEur = n(s.usdEur, 0.92, 0.1, 10);
   return s;
+}
+
+/** Cap percentage as stored/displayed: an integer 1..99, or null for "no cap". */
+function sanitizeCapPercent(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Math.round(Number(v));
+  if (!Number.isFinite(n) || n <= 0 || n >= 100) return null;
+  return n;
 }
 
 function saveSettings(settings) {
@@ -166,34 +639,33 @@ function _openCircuit(reason) {
 }
 
 // ─────────────────────────────────────────────────
-// Keychain helpers
+// Credential-store helpers
 // ─────────────────────────────────────────────────
 
+// Last line of defence: no OAuth token may reach stdout, the log file or an SSE client,
+// whatever the call site does. log() runs every line through this. Matches the Anthropic
+// token shapes (sk-ant-oat01-… access, sk-ant-ort01-… refresh, sk-ant-api03-… key) and
+// keeps a short prefix so a redacted line is still traceable to an account.
+const SECRET_RE = /\b(sk-ant-[a-z0-9]+-)([A-Za-z0-9_\-]{12,})/g;
+function redactSecrets(s) {
+  return typeof s === 'string' ? s.replace(SECRET_RE, (_m, p) => `${p}<redacted>`) : s;
+}
+
+// The names `readKeychain`/`writeKeychain` are kept because ~90 call sites and
+// several log lines use them, and on macOS a Keychain is exactly what they hit.
+// On Windows they reach the credentials file instead — see platform.mjs.
 function readKeychain() {
   try {
-    const raw = execSync(
-      `security find-generic-password -s "${KEYCHAIN_SERVICE}" -w`,
-      { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
-    ).trim();
-    return JSON.parse(raw);
+    return readCredentials();
   } catch (e) {
-    log('error', `Keychain read failed: ${e.message}`);
+    log('error', `Credential read failed: ${safeCredentialError(e)}`);
     return null;
   }
 }
 
 function writeKeychain(creds) {
-  const json = JSON.stringify(creds);
-  try {
-    execSync(
-      `security delete-generic-password -s "${KEYCHAIN_SERVICE}" -a "${KEYCHAIN_ACCOUNT}"`,
-      { stdio: 'pipe', timeout: 5000 }
-    );
-  } catch { /* might not exist */ }
-  execSync(
-    `security add-generic-password -s "${KEYCHAIN_SERVICE}" -a "${KEYCHAIN_ACCOUNT}" -w "${json.replace(/"/g, '\\"')}"`,
-    { stdio: 'pipe', timeout: 5000 }
-  );
+  // Throws on failure, with the token stripped from the message: callers log it.
+  writeCredentials(creds);
 }
 
 import https from 'node:https';
@@ -204,6 +676,9 @@ import {
   getFingerprintFromToken,
   buildForwardHeaders as _buildForwardHeaders,
   stripHopByHopHeaders,
+  UPSTREAM_RETRY_BACKOFF_MS,
+  isRetryableUpstreamStatus,
+  getUpstreamRetryPlan,
   createAccountStateManager,
   createBalanceLimiter,
   isAccountAvailable as _isAccountAvailable,
@@ -214,6 +689,7 @@ import {
   pickConserve as _pickConserve,
   pickAnyUntried as _pickAnyUntried,
   getEarliestReset as _getEarliestReset,
+  formatDuration,
   pickByStrategy as _pickByStrategy,
   createProbeTracker,
   createUtilizationHistory,
@@ -223,6 +699,13 @@ import {
   buildUpdatedCreds,
   shouldRefreshToken,
   createPerAccountLock,
+  billableTokens,
+  attributionForWindow,
+  ATTRIBUTION_BANDS,
+  resolveAccountCaps,
+  isOverUsageCap as _isOverUsageCap,
+  usageCapState as _usageCapState,
+  effectiveUtilization,
   ROTATION_STRATEGIES,
   ROTATION_INTERVALS,
 } from './lib.mjs';
@@ -323,11 +806,22 @@ try {
   }
 } catch { sessionHistory = []; }
 
+// Trace why autoDiscoverAccount() bailed out. It runs on every proxy request,
+// so log only when the outcome changes — steady state costs one line, and a
+// fresh /login leaves a readable trail instead of silence.
+let _discoLastSig = '';
+function traceDiscovery(outcome, fp = '', extra = '') {
+  const sig = `${fp}:${outcome}:${extra}`;
+  if (sig === _discoLastSig) return;
+  _discoLastSig = sig;
+  log('discover', `${outcome} (fp ${fp || '—'})${extra ? ' ' + extra : ''}`);
+}
+
 // Check if the current keychain creds match a saved profile.
 // If not, auto-save them as a new account.
 async function autoDiscoverAccount() {
   const creds = readKeychain();
-  if (!creds?.claudeAiOauth?.accessToken) return;
+  if (!creds?.claudeAiOauth?.accessToken) { traceDiscovery('bail: no token in keychain'); return; }
   const fp = getFingerprint(creds);
 
   // Check all saved profiles for a fingerprint match
@@ -352,7 +846,10 @@ async function autoDiscoverAccount() {
     try {
       const raw = await readFile(join(ACCOUNTS_DIR, file), 'utf8');
       const saved = JSON.parse(raw);
-      if (getFingerprint(saved) === fp) return; // exact same token already saved
+      if (getFingerprint(saved) === fp) { // exact same token already saved
+        traceDiscovery('known: exact token', fp, `→ ${savedName} (${email || 'email unresolved'})`);
+        return;
+      }
 
       // Same refresh token = same underlying account, even when email fetch failed
       const savedRefresh = saved.claudeAiOauth?.refreshToken;
@@ -362,6 +859,7 @@ async function autoDiscoverAccount() {
         const oldFp = getFingerprint(saved);
         migrateAccountState(saved.claudeAiOauth?.accessToken, token, oldFp, fp, savedName);
         console.log(`[auto-discover] Updated "${savedName}" with refreshed token (same refreshToken)`);
+        traceDiscovery('known: same refreshToken → updated in place', fp, `→ ${savedName}`);
         if (typeof invalidateAccountsCache === 'function') invalidateAccountsCache();
         invalidateTokenCache();
         return;
@@ -377,6 +875,7 @@ async function autoDiscoverAccount() {
           const oldFp = getFingerprint(saved);
           migrateAccountState(saved.claudeAiOauth?.accessToken, token, oldFp, fp, savedName);
           console.log(`[auto-discover] Updated "${savedName}" with refreshed token (${email})`);
+          traceDiscovery('known: same email → updated in place', fp, `→ ${savedName} (${email})`);
           if (typeof invalidateAccountsCache === 'function') invalidateAccountsCache();
           invalidateTokenCache(); // ensure getActiveToken() sees the updated token
           return;
@@ -393,6 +892,7 @@ async function autoDiscoverAccount() {
   const MAX_AUTO_ACCOUNTS = 5;
   if (idx > MAX_AUTO_ACCOUNTS) {
     console.log(`[auto-discover] Skipping — already ${idx - 1} auto accounts (max ${MAX_AUTO_ACCOUNTS})`);
+    traceDiscovery('bail: auto-account cap reached', fp, `${idx - 1}/${MAX_AUTO_ACCOUNTS}`);
     return;
   }
 
@@ -408,6 +908,7 @@ async function autoDiscoverAccount() {
   const displayName = email || name;
   logActivity('account-discovered', { name, label: displayName });
   console.log(`[auto-discover] New account saved as "${name}" (${displayName})`);
+  traceDiscovery('NEW account saved', fp, `→ ${name} (${displayName})`);
 
   // Invalidate caches so the proxy picks it up
   if (typeof invalidateAccountsCache === 'function') invalidateAccountsCache();
@@ -472,7 +973,7 @@ function saveHistoryToDisk() {
 
 loadHistoryFromDisk();
 
-// ── macOS desktop notifications ──
+// ── Desktop notifications ──
 
 let _lastNotifyAt = 0;
 const NOTIFY_THROTTLE_MS = 10_000; // max 1 notification per 10 seconds
@@ -482,12 +983,9 @@ function notify(title, message) {
   const now = Date.now();
   if (now - _lastNotifyAt < NOTIFY_THROTTLE_MS) return; // throttle notification spam
   _lastNotifyAt = now;
-  try {
-    const escaped = (s) => s.replace(/"/g, '\\"');
-    execFile('osascript', ['-e',
-      `display notification "${escaped(message)}" with title "${escaped(title)}" sound name "Blow"`
-    ], { timeout: 3000 }, () => {});
-  } catch { /* non-critical */ }
+  // osascript on macOS, a PowerShell toast on Windows, nothing elsewhere.
+  // Deliberately not awaited: a notification must never delay or fail routing.
+  notifyDesktop(title, message);
 }
 
 function fetchRateLimits(token) {
@@ -523,7 +1021,30 @@ function fetchRateLimits(token) {
           return;
         }
         const h = res.headers;
+        // Did this response actually carry rate-limit information? A 200 or 429
+        // can come back without the unified headers (a malformed request, an
+        // error the gateway answered itself, a 429 that only carries retry-after).
+        // Every field below defaults to 0, so without this flag "no information"
+        // is indistinguishable from "genuinely at zero" — and the caller would
+        // cache those zeros for 5 minutes, overwrite the last good reading, and
+        // paint a used-up account as empty.
+        const RATE_KEYS = [
+          'anthropic-ratelimit-unified-status',
+          'anthropic-ratelimit-unified-5h-utilization',
+          'anthropic-ratelimit-unified-7d-utilization',
+          'anthropic-ratelimit-unified-5h-status',
+          'anthropic-ratelimit-unified-7d-status',
+          'anthropic-ratelimit-unified-5h-reset',
+          'anthropic-ratelimit-unified-7d-reset',
+        ];
+        // Which of them actually arrived, so callers can tell a real 0 from a
+        // field the response never mentioned.
+        const rateHeaders = {};
+        for (const k of RATE_KEYS) if (h[k] !== undefined) rateHeaders[k] = h[k];
+        const hasLimits = Object.keys(rateHeaders).length > 0;
         resolve({
+          hasLimits,
+          rateHeaders,
           status: h['anthropic-ratelimit-unified-status'] || (res.statusCode === 429 ? 'limited' : 'unknown'),
           fiveH: {
             status: h['anthropic-ratelimit-unified-5h-status'] || 'unknown',
@@ -602,16 +1123,41 @@ async function getRateLimitsForToken(token, fp, { allowProbe = true } = {}) {
 
   recordProbe();
   const data = await fetchRateLimits(token);
-  if (data) {
-    rateLimitCache.set(fp, { data, fetchedAt: Date.now() });
+  // A probe that came back carrying no rate-limit headers tells us nothing. Treat
+  // it exactly like a failed probe: keep the last known reading rather than
+  // writing zeros over it. Otherwise a single silent response blanks the card for
+  // five minutes and — worse — feeds 0% to the usage-cap check, which would let a
+  // capped account be picked again.
+  if (data && data.hasLimits) {
+    // Merge the probe over the last known reading rather than replacing it: a
+    // response that carried `unified-status` but no utilization headers would
+    // otherwise persist 0% over a real 100%.
+    const seen = data.rateHeaders || {};
+    const merged = { ...data };
+    const prevKnown = persistedState[fp] || {};
+    if (seen['anthropic-ratelimit-unified-5h-utilization'] === undefined)
+      merged.fiveH = { ...merged.fiveH, utilization: prevKnown.utilization5h ?? 0 };
+    if (seen['anthropic-ratelimit-unified-7d-utilization'] === undefined)
+      merged.sevenD = { ...merged.sevenD, utilization: prevKnown.utilization7d ?? 0 };
+    if (seen['anthropic-ratelimit-unified-5h-reset'] === undefined)
+      merged.fiveH = { ...merged.fiveH, reset: prevKnown.resetAt ?? 0 };
+    if (seen['anthropic-ratelimit-unified-7d-reset'] === undefined)
+      merged.sevenD = { ...merged.sevenD, reset: prevKnown.resetAt7d ?? 0 };
+
+    rateLimitCache.set(fp, { data: merged, fetchedAt: Date.now() });
     // Persist probe results
     updatePersistedState(fp, {
-      utilization5h: data.fiveH.utilization,
-      utilization7d: data.sevenD.utilization,
-      resetAt: data.fiveH.reset,
-      resetAt7d: data.sevenD.reset,
+      utilization5h: merged.fiveH.utilization,
+      utilization7d: merged.sevenD.utilization,
+      resetAt: merged.fiveH.reset,
+      resetAt7d: merged.sevenD.reset,
     });
-    return data;
+    // …and into the live state the pickers read, or a stale `limited` would never lift.
+    reconcileFromProbe(token, data);
+    return merged;
+  }
+  if (data && !data.hasLimits) {
+    log('probe', `${fp.slice(0, 8)}…: probe returned no rate-limit headers — keeping the last known reading`);
   }
 
   // 5. Probe failed  - fall back to stale persisted data instead of null
@@ -636,6 +1182,25 @@ async function loadProfiles() {
   } catch {
     files = [];
   }
+
+  // My token consumption per account, for the tray's "my share" view. This VDM
+  // only sees traffic routed through it (i.e. mine), so myTokens is a precise
+  // count of MY usage on the shared account; the account-wide utilization (from
+  // Anthropic's headers) is the total (me + everyone else sharing the account).
+  const nowMs = Date.now();
+  const usage = loadTokenUsage();
+  const win5h = nowMs - 5 * 3600 * 1000;
+  const win7d = nowMs - 7 * 24 * 3600 * 1000;
+  const myTokensFor = (acctLabel) => {
+    let t5 = 0, t7 = 0;
+    for (const r of usage) {
+      if (r.account !== acctLabel) continue;
+      const tok = billableTokens(r);
+      if (r.ts >= win7d) t7 += tok;
+      if (r.ts >= win5h) t5 += tok;
+    }
+    return { t5, t7 };
+  };
 
   const profiles = [];
   for (const file of files) {
@@ -721,6 +1286,52 @@ async function loadProfiles() {
         } catch { /* non-critical */ }
       }
 
+      const mine = myTokensFor(email || name);
+      const acctSt = accountState.get(oauth.accessToken);
+      // Classify WHY an account is unavailable so the tray can tell apart
+      // "you used up the quota" (unified 5h/7d full) from "blocked for another
+      // reason" — a per-model cap (e.g. weekly Opus) that the unified
+      // utilization doesn't reflect, an auth problem, or a manual opt-out.
+      const u5 = rateLimits?.fiveH?.utilization || 0;
+      const u7 = rateLimits?.sevenD?.utilization || 0;
+      const cooldownActive = (acctSt?.retryAfter || 0) > Date.now(); // a persisted, real 429 wall
+      // Trust UTILIZATION for a "quota" block and a persisted 429 cooldown for a
+      // per-model block. A bare status:'limited' with LOW utilization is a
+      // transient probe bounce (a rebound 429 makes fetchRateLimits stamp
+      // 'limited' even at 0% usage) — ignore it, otherwise every rebound paints
+      // the account red while the dashboard (which reads utilization) stays green.
+      let blockKind = null;
+      if (readAccountDisabled(name)) blockKind = 'disabled';
+      else if (proxyExpired) blockKind = 'auth';
+      else if (u5 >= 0.9) blockKind = 'quota-5h';    // 5h window genuinely full
+      else if (u7 >= 0.9) blockKind = 'quota-7d';    // weekly window genuinely full
+      else if (acctSt?.blockKind === 'extra-usage') blockKind = 'extra-usage';
+      else if (cooldownActive) blockKind = 'model';  // real 429 but utilization low → per-model cap (Opus/Fable/Sonnet)
+      // else: no genuine block (a lone status:'limited' is treated as a bounce)
+
+      // Usage caps: what's configured (own override vs inherited global) and
+      // whether either window is currently past it.
+      const capOverride = readAccountCapOverride(name);
+      const resolvedCaps = resolveAccountCaps(capOverride, { fiveH: settings.usageCap5h, sevenD: settings.usageCap7d });
+      const capAcct = { token: oauth.accessToken, capFiveH: resolvedCaps.fiveH, capSevenD: resolvedCaps.sevenD };
+      const capLive = oauth.accessToken ? _usageCapState(capAcct, accountState) : { over5h: false, over7d: false, over: false, freeAt: 0 };
+      const capInfo = {
+        override: capOverride,                                   // percent or null, per window
+        effective: {                                             // percent actually in force
+          fiveH: resolvedCaps.fiveH === null ? null : Math.round(resolvedCaps.fiveH * 100),
+          sevenD: resolvedCaps.sevenD === null ? null : Math.round(resolvedCaps.sevenD * 100),
+        },
+        ...capLive,
+      };
+
+      // Keep the exposed rate-limit status in sync with blockKind so the tray
+      // (which colours on fiveH.status) doesn't light up on a bounce.
+      const rl = rateLimits ? JSON.parse(JSON.stringify(rateLimits)) : rateLimits;
+      if (rl) {
+        if (rl.fiveH) rl.fiveH.status = (blockKind === 'quota-5h') ? 'limited' : 'allowed';
+        if (rl.sevenD) rl.sevenD.status = (blockKind === 'quota-7d') ? 'limited' : 'allowed';
+        rl.status = (blockKind && blockKind.startsWith('quota')) ? 'limited' : 'allowed';
+      }
       profiles.push({
         name,
         label: email || name,
@@ -729,13 +1340,30 @@ async function loadProfiles() {
         expiresAt,
         isActive,
         fingerprint: fp,
-        rateLimits,
+        rateLimits: rl,
         dormant,
         expired: proxyExpired,
         refreshFailed: refreshFailures.get(name) || null,
+        priority: readAccountPriority(name),
+        disabled: readAccountDisabled(name),
+        // Real availability + my share, for the tray (an account can be unified
+        // 'allowed' yet 429 on Opus — surfaced here so the tray isn't misleading).
+        limited: blockKind !== null,
+        retryAfter: acctSt?.retryAfter || 0,
+        blockKind, // null | 'quota-5h' | 'quota-7d' | 'extra-usage' | 'model' | 'disabled' | 'auth'
+        myTokens5h: mine.t5,
+        myTokens7d: mine.t7,
+        // What the caps are and whether they've bitten, for the card + the badge.
+        cap: capInfo,
+        // How much of this account's usage is mine, in tokens, list-price value,
+        // and chronological bands.
+        attribution: usageAttribution(email || name, fp),
       });
-    } catch {
-      // skip corrupt files
+    } catch (e) {
+      // Skip the account rather than failing the whole list — but say which one and
+      // why. This used to be silent, and a bug anywhere in the per-account block
+      // emptied the dashboard with no trace of the cause.
+      log('warn', `Skipping account ${name} while building profiles: ${e.message}`);
     }
   }
 
@@ -759,6 +1387,7 @@ async function loadProfiles() {
       try {
         unlinkSync(join(ACCOUNTS_DIR, `${loser.name}.json`));
         try { unlinkSync(join(ACCOUNTS_DIR, `${loser.name}.label`)); } catch {}
+        try { unlinkSync(join(ACCOUNTS_DIR, `${loser.name}.priority`)); } catch {}
         log('dedup', `Removed duplicate account "${loser.name}" (same email as "${keepNew ? p.name : prevP.name}")`);
       } catch (e) {
         log('warn', `Failed to remove duplicate account file "${loser.name}": ${e.message}`);
@@ -810,7 +1439,7 @@ async function handleAPI(req, res) {
     const allExhausted = allAccounts.length > 0 &&
       allAccounts.every(a => !isAccountAvailable(a.token, a.expiresAt));
     const earliestReset = allExhausted ? getEarliestReset() : null;
-    json(res, { profiles, stats, probeStats, allExhausted, earliestReset, rotationStrategy: settings.rotationStrategy, queueStats: getQueueStats() });
+    json(res, { profiles, stats, probeStats, allExhausted, earliestReset, rotationStrategy: settings.rotationStrategy, queueStats: getQueueStats(), passthrough: _circuitOpen && (Date.now() - _circuitOpenAt <= CIRCUIT_COOLDOWN_MS) });
     return true;
   }
 
@@ -874,9 +1503,93 @@ async function handleAPI(req, res) {
       // Delete account files
       await unlink(file);
       try { await unlink(join(ACCOUNTS_DIR, `${name}.label`)); } catch {}
+      try { await unlink(join(ACCOUNTS_DIR, `${name}.priority`)); } catch {}
       logActivity('account-removed', { name });
       if (typeof invalidateAccountsCache === 'function') invalidateAccountsCache();
       json(res, { ok: true });
+    } catch (e) {
+      json(res, { ok: false, error: e.message }, 400);
+    }
+    return true;
+  }
+
+  if (url.pathname === '/api/priority' && req.method === 'POST') {
+    const body = await readBody(req);
+    const { name, priority } = JSON.parse(body);
+    if (!name) {
+      json(res, { ok: false, error: 'name required' }, 400);
+      return true;
+    }
+    if (!existsSync(join(ACCOUNTS_DIR, `${name}.json`))) {
+      json(res, { ok: false, error: `Unknown account "${name}"` }, 404);
+      return true;
+    }
+    const n = parseInt(priority, 10);
+    if (!Number.isFinite(n)) {
+      json(res, { ok: false, error: 'priority must be an integer' }, 400);
+      return true;
+    }
+    try {
+      const saved = writeAccountPriority(name, n);
+      invalidateAccountsCache();
+      logActivity('priority-set', { name, priority: saved });
+      json(res, { ok: true, name, priority: saved });
+    } catch (e) {
+      json(res, { ok: false, error: e.message }, 400);
+    }
+    return true;
+  }
+
+  if (url.pathname === '/api/account-enabled' && req.method === 'POST') {
+    const body = await readBody(req);
+    const { name, enabled } = JSON.parse(body);
+    if (!name) {
+      json(res, { ok: false, error: 'name required' }, 400);
+      return true;
+    }
+    if (!existsSync(join(ACCOUNTS_DIR, `${name}.json`))) {
+      json(res, { ok: false, error: `Unknown account "${name}"` }, 404);
+      return true;
+    }
+    try {
+      // Disabling the active account is fine: the next request finds it absent
+      // from the rotation pool and switches away automatically.
+      const disabled = writeAccountDisabled(name, enabled === false);
+      invalidateAccountsCache();
+      logActivity('account-enabled', { name, enabled: !disabled });
+      json(res, { ok: true, name, enabled: !disabled });
+    } catch (e) {
+      json(res, { ok: false, error: e.message }, 400);
+    }
+    return true;
+  }
+
+  // Per-account cap override. Send a field as null to inherit the global cap again;
+  // omit it to leave it as it is.
+  if (url.pathname === '/api/account-cap' && req.method === 'POST') {
+    const body = await readBody(req);
+    const patch = JSON.parse(body);
+    const name = patch?.name;
+    if (!name) {
+      json(res, { ok: false, error: 'name required' }, 400);
+      return true;
+    }
+    if (!existsSync(join(ACCOUNTS_DIR, `${name}.json`))) {
+      json(res, { ok: false, error: `Unknown account "${name}"` }, 404);
+      return true;
+    }
+    try {
+      const current = readAccountCapOverride(name);
+      const next = writeAccountCapOverride(name, {
+        fiveH: 'fiveH' in patch ? patch.fiveH : current.fiveH,
+        sevenD: 'sevenD' in patch ? patch.sevenD : current.sevenD,
+      });
+      invalidateAccountsCache();
+      logActivity('account-cap', { name, ...next });
+      log('cap', `${name}: cap 5h=${next.fiveH ?? 'globale'}, 7d=${next.sevenD ?? 'globale'}`);
+      // Raising or clearing a cap can free an account that requests are parked on.
+      wakeCapHolders(`cap changed on ${name}`);
+      json(res, { ok: true, name, cap: next });
     } catch (e) {
       json(res, { ok: false, error: e.message }, 400);
     }
@@ -978,6 +1691,24 @@ async function handleAPI(req, res) {
     }
     if (typeof patch.commitTokenUsage === 'boolean') settings.commitTokenUsage = patch.commitTokenUsage;
     if (typeof patch.sessionMonitor === 'boolean') settings.sessionMonitor = patch.sessionMonitor;
+    // Usage caps. `null` is a meaningful value here (= turn the cap off), so these
+    // test for presence of the key rather than for a number.
+    let capsTouched = false;
+    if ('usageCap5h' in patch) { settings.usageCap5h = sanitizeCapPercent(patch.usageCap5h); capsTouched = true; }
+    if ('usageCap7d' in patch) { settings.usageCap7d = sanitizeCapPercent(patch.usageCap7d); capsTouched = true; }
+    if (typeof patch.usageCapHoldMin === 'number' && patch.usageCapHoldMin >= 0 && patch.usageCapHoldMin <= MAX_HOLD_MIN) {
+      settings.usageCapHoldMin = Math.floor(patch.usageCapHoldMin);
+    }
+    if (typeof patch.usdEur === 'number' && patch.usdEur > 0 && patch.usdEur <= 10) {
+      settings.usdEur = patch.usdEur;
+    }
+    if (capsTouched) {
+      // Caps are resolved onto each account by loadAllAccountTokens(), so the cached
+      // account list is stale the moment they change.
+      invalidateAccountsCache();
+      log('cap', `Usage caps: 5h=${settings.usageCap5h ?? 'off'}%, 7d=${settings.usageCap7d ?? 'off'}%`);
+      wakeCapHolders('caps changed');
+    }
     saveSettings(settings);
     logActivity('settings-changed', {
       autoSwitch: settings.autoSwitch, proxyEnabled: settings.proxyEnabled,
@@ -1003,17 +1734,17 @@ async function handleAPI(req, res) {
       // UserPromptSubmit hooks (otherwise we'd lose usage from earlier prompts)
       if (!pendingSessions.has(sessionId)) {
         let repo = cwd, branch = '(no git)', commitHash = '';
-        try {
-          // Use --git-common-dir to resolve to main repo root (not worktree directory)
-          // so worktree sessions group with the parent repo in the dashboard.
-          try {
-            repo = execSync(`git -C "${cwd}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim().replace(/\/\.git\/?$/, '');
-          } catch {
-            repo = execSync(`git -C "${cwd}" rev-parse --show-toplevel 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
-          }
-          branch = _resolveWorktreeBranch(cwd, execSync(`git -C "${cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim());
-          commitHash = execSync(`git -C "${cwd}" rev-parse --short HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
-        } catch { /* not a git repo */ }
+        // --git-common-dir resolves to the main repo root rather than the
+        // worktree directory, so worktree sessions group with their parent.
+        // The trailing `.git` strip must accept a backslash too: on Windows
+        // git returns C:/repo/.git with forward slashes, but a caller-supplied
+        // cwd can still arrive backslashed.
+        const commonDir = gitIn(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
+        if (commonDir) repo = commonDir.replace(/[\/\\]\.git[\/\\]?$/, '');
+        else repo = gitIn(cwd, ['rev-parse', '--show-toplevel']) || cwd;
+        const head = gitIn(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']);
+        if (head) branch = _resolveWorktreeBranch(cwd, head);
+        commitHash = gitIn(cwd, ['rev-parse', '--short', 'HEAD']) || '';
         pendingSessions.set(sessionId, { repo, branch, commitHash, cwd, startedAt: Date.now() });
         ensureLocalCommitHook(cwd);
         log('tokens', `Session started: ${sessionId.slice(0, 8)}… (${basename(repo)}/${branch})`);
@@ -1022,14 +1753,13 @@ async function handleAPI(req, res) {
         const session = pendingSessions.get(sessionId);
         // Keep cwd up to date so periodic persist and auto-claim use the latest directory
         if (cwd && cwd !== session.cwd) session.cwd = cwd;
-        try {
-          const newBranch = _resolveWorktreeBranch(cwd, execSync(`git -C "${cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim());
-          if (newBranch && newBranch !== session.branch) {
-            log('tokens', `Session ${sessionId.slice(0, 8)}… branch updated: ${session.branch} → ${newBranch}`);
-            session.branch = newBranch;
-            session.commitHash = execSync(`git -C "${cwd}" rev-parse --short HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
-          }
-        } catch { /* ignore */ }
+        const head = gitIn(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']);
+        const newBranch = head ? _resolveWorktreeBranch(cwd, head) : null;
+        if (newBranch && newBranch !== session.branch) {
+          log('tokens', `Session ${sessionId.slice(0, 8)}… branch updated: ${session.branch} → ${newBranch}`);
+          session.branch = newBranch;
+          session.commitHash = gitIn(cwd, ['rev-parse', '--short', 'HEAD']) || session.commitHash;
+        }
       }
       // Prune stale sessions (>24h — sessions can be long-lived)
       const staleThreshold = Date.now() - 24 * 60 * 60 * 1000;
@@ -1065,16 +1795,7 @@ async function handleAPI(req, res) {
       const stopAt = Date.now();
       const claimed = claimUsageInRange(session.startedAt, stopAt);
       for (const entry of claimed) {
-        appendTokenUsage({
-          ts: entry.ts,
-          repo: session.repo,
-          branch: session.branch,
-          commitHash: session.commitHash,
-          model: entry.model,
-          inputTokens: entry.inputTokens,
-          outputTokens: entry.outputTokens,
-          account: entry.account,
-        });
+        appendTokenUsage(tokenUsageRow(entry, session));
       }
       pendingSessions.delete(sessionId);
       log('tokens', `Session stopped: ${sessionId.slice(0, 8)}… (claimed ${claimed.length} entries)`);
@@ -1092,23 +1813,10 @@ async function handleAPI(req, res) {
       let flushed = 0;
       for (const [id, session] of pendingSessions) {
         const now = Date.now();
-        if (session.cwd) {
-          try {
-            const cur = _resolveWorktreeBranch(session.cwd, execSync(`git -C "${session.cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim());
-            if (cur && cur !== session.branch) {
-              session.branch = cur;
-              session.commitHash = execSync(`git -C "${session.cwd}" rev-parse --short HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
-            }
-          } catch { /* ignore */ }
-        }
+        refreshSessionBranch(session);
         const claimed = claimUsageInRange(session.startedAt, now);
         for (const entry of claimed) {
-          appendTokenUsage({
-            ts: entry.ts, repo: session.repo, branch: session.branch,
-            commitHash: session.commitHash, model: entry.model,
-            inputTokens: entry.inputTokens, outputTokens: entry.outputTokens,
-            account: entry.account,
-          });
+          appendTokenUsage(tokenUsageRow(entry, session));
         }
         if (claimed.length > 0) {
           session.startedAt = now;
@@ -1219,6 +1927,14 @@ function renderHTML() {
     --card: #fff;
     --foreground: hsl(224 71% 4%);
     --muted: hsl(220 9% 46%);
+    /* Used in six places (switch knob, OFF caption, disabled badge, …) but never
+       defined — so all six resolved to nothing: transparent knob, invisible
+       captions. The OFF switch in particular rendered as an empty grey pill,
+       which is why it looked broken. */
+    --muted-foreground: hsl(220 9% 40%);
+    /* Also referenced but never defined (log/session buttons), which left them
+       with no hover background at all. */
+    --surface: hsl(220 14% 96%);
     --border: hsl(220 13% 91%);
     --primary: hsl(217 91% 60%);
     --primary-soft: hsl(217 91% 97%);
@@ -1414,6 +2130,10 @@ function renderHTML() {
   }
   .tab {
     flex: 1;
+    /* Six equal tabs stop fitting below ~365px and pushed the whole page into a
+       horizontal scroll. min-width:0 lets them shrink past their label width
+       within the row instead of forcing it wider than the viewport. */
+    min-width: 0;
     padding: 0.5rem 0;
     font-size: 0.9375rem;
     font-weight: 500;
@@ -1467,12 +2187,19 @@ function renderHTML() {
     align-items: center;
     justify-content: space-between;
     margin-bottom: 0.75rem;
+    /* The identity and the badges shared one non-wrapping row. Adding a third
+       badge (the cap one) pushed it past the viewport below ~450px and made the
+       whole page scroll sideways. Both halves may now wrap. */
+    flex-wrap: wrap;
+    gap: 0.375rem;
   }
   .card-identity {
     display: flex;
     align-items: center;
     gap: 0.625rem;
+    min-width: 0;
   }
+  .card-badges { flex-wrap: wrap; }
   .status-dot {
     width: 8px; height: 8px;
     border-radius: 50%;
@@ -1508,6 +2235,17 @@ function renderHTML() {
   .badge-pro { color: var(--primary); background: var(--blue-soft); border-color: var(--blue-border); }
   .badge-free { color: var(--muted); background: var(--bg); border-color: var(--border); }
   .badge-active { color: var(--green); background: var(--green-soft); border-color: var(--green-border); }
+  .badge-extra-usage { color: var(--red); background: var(--red-soft); border-color: var(--red-border); }
+  .extra-usage-msg {
+    margin-top: 0.625rem;
+    padding: 0.5rem 0.625rem;
+    border: 1px solid var(--red-border);
+    border-radius: var(--radius-sm);
+    color: var(--red);
+    background: var(--red-soft);
+    font-size: 0.75rem;
+    line-height: 1.35;
+  }
 
   .card-token.tok-bad { color: var(--red); }
 
@@ -1560,6 +2298,175 @@ function renderHTML() {
     font-variant-numeric: tabular-nums;
   }
 
+  /* ── Usage cap ── */
+  /* The track needs a positioning context so the cap marker can sit on it. */
+  .rate-track { position: relative; overflow: visible; }
+  .rate-track > .rate-fill { border-radius: 2px 0 0 2px; }
+  .cap-marker {
+    position: absolute;
+    top: -3px; bottom: -3px;
+    width: 2px;
+    background: var(--foreground);
+    border-radius: 1px;
+    pointer-events: none;
+  }
+  /* No floating label above the tick: it was absolutely positioned over the
+     header line and collided with it at every width. The cap value lives in the
+     header instead, on the same line as the utilization it has to be compared
+     against — which is where you actually want to read it. */
+  .cap-marker.hit { background: var(--red); }
+  .rate-cap {
+    font-size: 0.625rem;
+    font-weight: 600;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    /* It reads before the utilization now: the ceiling first, then where the
+       account stands against it. The gap goes on the trailing side. */
+    margin-right: 0.375rem;
+  }
+  .rate-cap.hit { color: var(--red); }
+
+  /* Inline, because it lives on the priority row: both decide whether this
+     account gets picked at all. It wraps as one unit when the row runs out. */
+  .cap-row {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    font-size: 0.6875rem;
+    color: var(--muted);
+  }
+  .cap-row .cap-lab { font-weight: 600; }
+  .cap-in {
+    width: 3.25rem;
+    padding: 0.125rem 0.25rem;
+    font: inherit;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--card);
+    color: var(--foreground);
+  }
+  .cap-in::placeholder { color: var(--muted); opacity: 0.7; }
+  /* The unit sits inside the field's border, so the box reads as "75%" rather
+     than as a bare number you have to know the unit of. */
+  .cap-field {
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--card);
+    padding-right: 0.3125rem;
+  }
+  .cap-field .cap-in {
+    border: none;
+    background: none;
+    width: 2.25rem;
+    padding-right: 0.0625rem;
+  }
+  .cap-field .cap-in:focus { outline: none; }
+  .cap-field:focus-within { border-color: var(--primary); }
+  .cap-pct { color: var(--muted); font-size: 0.6875rem; }
+  /* Hide the spinner: it steals width from a two-digit field. */
+  .cap-in::-webkit-outer-spin-button,
+  .cap-in::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+  .cap-in { -moz-appearance: textfield; appearance: textfield; }
+  .cap-note { color: var(--muted); }
+  .cap-hit { color: var(--red); font-weight: 600; }
+
+  /* ── Usage attribution strip ── */
+  /* A chronological timeline, oldest → newest, one cell per slice. Cells are
+     contiguous in time, so they're separated by a 1px surface gap rather than a
+     bar-chart gap — the strip reads as one continuous window. */
+  .attr-strip {
+    display: flex;
+    gap: 1px;
+    height: 10px;
+    margin-top: 0.375rem;
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .attr-cell { flex: 1 1 0; min-width: 0; border-radius: 1px; }
+  /* Blue = measured here (mine). Dark orange = the account moved without this
+     proxy. Validated as a categorical pair: CVD ΔE 30 (protan) / 34.6 (tritan),
+     both ≥3:1 on the card surface. Deliberately not --yellow / --red / --green,
+     which mean warning / error / ok elsewhere on this page. */
+  .attr-mine { background: #3c83f6; }
+  .attr-ext  { background: #e8590c; }
+  /* Absence of measurement is not a third category — no hue, and hatched so it
+     never reads as a value. */
+  .attr-unknown {
+    background: repeating-linear-gradient(
+      135deg, var(--border) 0 2px, transparent 2px 4px);
+  }
+  .attr-idle { background: var(--bg); }
+
+  .attr-legend {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.3125rem;
+    font-size: 0.625rem;
+    color: var(--muted);
+  }
+  .attr-legend .lg { display: inline-flex; align-items: center; gap: 0.25rem; }
+  /* The class here is 'key', NOT 'sw': 'sw' is the toggle-switch class, and its
+     '.sw::before' paints a 14px white circle with a shadow. On an 8px legend
+     square that circle covered the swatch and spilled past its right edge — the
+     round blob next to the labels. A pseudo-element inherited from an unrelated
+     component is invisible in the markup and in a size-only DOM check, which is
+     why it survived two rounds of fixes.
+     All three keys must also be geometrically identical: with border-box, a
+     border on just one shrinks its fill from 8x8 to 6x6. */
+  .attr-legend .key {
+    width: 8px; height: 8px;
+    border-radius: 2px;
+    border: 1px solid rgba(0, 0, 0, 0.14);
+    flex: none;
+  }
+  /* The strip's hatch is deliberately not reused here: it works across contiguous
+     cells, where the diagonals line up into a texture, but on a lone 8px square it
+     renders as one off-centre streak. */
+  .attr-legend .key.attr-unknown { background: var(--bg); }
+  .attr-figure {
+    font-size: 0.6875rem;
+    color: var(--foreground);
+    margin-top: 0.3125rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .attr-figure .dim { color: var(--muted); font-weight: 400; }
+  .attr-breakdown {
+    color: var(--muted);
+    font-size: 0.625rem;
+    margin-top: 0.125rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .attr-caveat { color: var(--muted); font-size: 0.625rem; margin-top: 0.125rem; }
+
+  /* ── Narrow windows ──
+     The card had no breakpoints at all: two fixed columns with a 3rem gutter, at
+     any width. Measured at 390px that left ~146px per column, where the strip's
+     cells fall to 2.7px and every text line wraps three ways. Below 640px the two
+     windows stack instead of competing for the same row. */
+  @media (max-width: 640px) {
+    .rate-bars { grid-template-columns: 1fr; gap: 1.25rem; }
+  }
+  @media (max-width: 900px) {
+    .rate-bars { gap: 1.5rem; }
+  }
+  /* A 1px gap on a 3px cell is a third of the cell. Below this width the strip
+     reads better as a continuous band — which is what it actually is. */
+  @media (max-width: 520px) {
+    .attr-strip { gap: 0; }
+  }
+  /* Below this the six tab labels no longer fit even shrunk; let them wrap onto
+     a second row rather than forcing the page to scroll sideways. */
+  @media (max-width: 400px) {
+    .tabs { flex-wrap: wrap; }
+    .tab { flex: 1 1 30%; font-size: 0.8125rem; }
+  }
+
   .switch-btn {
     padding: 0.5rem 1.125rem;
     border-radius: var(--radius-sm);
@@ -1581,6 +2488,100 @@ function renderHTML() {
   }
   .switch-btn:active { transform: scale(0.98); }
 
+  .card-priority {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem 0.75rem;
+    margin-top: 0.75rem;
+  }
+  .prio-group { display: inline-flex; align-items: center; gap: 0.5rem; }
+  .prio-cap {
+    font-size: 0.75rem;
+    font-weight: 500;
+    color: var(--muted-foreground);
+    letter-spacing: 0.02em;
+  }
+  .prio-btn {
+    width: 1.375rem;
+    height: 1.375rem;
+    line-height: 1;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--foreground);
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+    font-family: inherit;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+  }
+  .prio-btn:hover { background: var(--muted); }
+  .prio-val {
+    min-width: 1.25rem;
+    text-align: center;
+    font-size: 0.8125rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--foreground);
+  }
+  /* Per-account enable/disable switch (sits on the priority row, right-aligned) */
+  .enable-wrap {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .enable-cap {
+    font-size: 0.6875rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    color: var(--muted-foreground);
+    font-variant-numeric: tabular-nums;
+  }
+  .enable-sw {
+    width: 2rem;
+    height: 1.125rem;
+    padding: 0;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    /* A pale knob needs a track darker than the card to sit on; the vendor's own
+       .sw does the same. The earlier dark-grey knob on a near-white track read as
+       a smudge rather than a switch. */
+    background: hsl(220 13% 82%);
+    cursor: pointer;
+    position: relative;
+    transition: background 0.15s, border-color 0.15s;
+    flex: none;
+  }
+  .enable-sw::after {
+    content: '';
+    position: absolute;
+    top: 50%;
+    left: 0.1875rem;
+    width: 0.75rem;
+    height: 0.75rem;
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+    transform: translateY(-50%);
+    transition: left 0.15s, background 0.15s;
+  }
+  .enable-sw.on { background: var(--green-soft); border-color: var(--green-border); }
+  .enable-sw.on::after { left: calc(100% - 0.9375rem); background: var(--green); }
+  .enable-sw:disabled { opacity: 0.5; cursor: progress; }
+  .card.off { opacity: 0.55; }
+  .card.off:hover { opacity: 0.75; }
+  .badge-off { color: var(--muted-foreground); background: var(--bg); border-color: var(--border); }
+  .off-msg {
+    margin-top: 0.5rem;
+    font-size: 0.75rem;
+    color: var(--muted-foreground);
+  }
   .remove-btn {
     padding: 0.375rem 0.75rem;
     border-radius: var(--radius-sm);
@@ -2363,7 +3364,7 @@ function renderHTML() {
 
   <div id="exhausted-banner" class="exhausted-banner" style="display:none">
     <span class="exhausted-icon">!</span>
-    <span>All accounts rate-limited. Next available: <strong id="exhausted-reset"> -</strong></span>
+    <span>No selectable accounts. Next retry: <strong id="exhausted-reset"> -</strong></span>
   </div>
 
   <div class="tabs">
@@ -2470,6 +3471,52 @@ function renderHTML() {
       </div>
 
       <div class="config-section">
+        <div class="config-section-title">Tetto di utilizzo</div>
+        <div class="config-row">
+          <div class="config-info">
+            <div class="config-label">Tetto finestra 5h</div>
+            <div class="config-desc">Oltre questa percentuale VDM smette di scegliere un account, e lo riprende da solo quando la finestra si azzera. Vuoto = nessun tetto. Un singolo account può avere il suo, dalla sua card.</div>
+          </div>
+          <input class="cap-in" type="number" min="1" max="99" id="cap-5h" placeholder="off"
+                 onchange="changeGlobalCap('usageCap5h', this.value)">
+        </div>
+        <div class="config-row">
+          <div class="config-info">
+            <div class="config-label">Tetto finestra settimanale</div>
+            <div class="config-desc">Stessa cosa sulla finestra da 7 giorni — quella che, arrivata al 100%, mette fuori gioco l'account per un giorno intero.</div>
+          </div>
+          <input class="cap-in" type="number" min="1" max="99" id="cap-7d" placeholder="off"
+                 onchange="changeGlobalCap('usageCap7d', this.value)">
+        </div>
+        <div class="config-row">
+          <div class="config-info">
+            <div class="config-label">Cambio USD→EUR</div>
+            <div class="config-desc">I prezzi Anthropic sono in dollari. Serve solo a mostrare in euro il valore a listino del tuo uso: niente qui scarica un cambio aggiornato, quindi correggilo tu quando serve.</div>
+          </div>
+          <input class="cap-in" type="number" min="0.1" max="10" step="0.01" id="cfg-usdeur"
+                 onchange="changeUsdEur(this.value)">
+        </div>
+        <div class="config-row">
+          <div class="config-info">
+            <div class="config-label">Attesa massima quando sono tutti fermi</div>
+            <div class="config-desc">Se nessun account è utilizzabile — perché è oltre il tetto o perché Anthropic lo ha limitato — le richieste restano in attesa invece di fallire. Scaduto questo tempo rispondono 429. 0 = nessuna attesa. Con un reset noto l'attesa finisce lì, prima di questo tetto; sulle attese lunghe conta anche il client, che può chiudere la richiesta per conto suo.</div>
+          </div>
+          <select class="config-select" id="sel-cap-hold" onchange="changeCapHold(Number(this.value))">
+            <option value="0">nessuna</option>
+            <option value="2">2 min</option>
+            <option value="5">5 min</option>
+            <option value="10">10 min</option>
+            <option value="30">30 min</option>
+            <option value="60">1 ora</option>
+            <option value="180">3 ore</option>
+            <option value="360">6 ore</option>
+            <option value="720">12 ore</option>
+            <option value="1440">24 ore</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="config-section">
         <div class="config-section-title">Rotation Strategy</div>
         <div class="config-row">
           <div class="config-info">
@@ -2483,6 +3530,7 @@ function renderHTML() {
             <option value="spread">Spread</option>
             <option value="drain-first">Drain first</option>
             <option value="balance">Balance</option>
+            <option value="priority">Priority</option>
           </select>
         </div>
         <div class="config-row" id="interval-ctrl" style="display:none">
@@ -2708,6 +3756,114 @@ async function doRemove(name, e) {
   } catch(e) { showToast('Failed to remove'); }
 }
 
+async function bumpPriority(name, delta, e) {
+  if (e) e.stopPropagation();
+  const card = e && e.currentTarget ? e.currentTarget.closest('.card') : null;
+  const valEl = card ? card.querySelector('.prio-val') : null;
+  const current = valEl ? (parseInt(valEl.textContent, 10) || 0) : 0;
+  const next = current + delta;
+  if (valEl) valEl.textContent = String(next); // optimistic
+  try {
+    const resp = await fetch('/api/priority', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ name, priority: next })
+    });
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || 'failed');
+    if (valEl) valEl.textContent = String(data.priority);
+  } catch(err) {
+    if (valEl) valEl.textContent = String(current); // revert
+    showToast('Priority update failed: ' + err.message);
+  }
+}
+
+// Enable/disable one account. Disabling drops it from the rotation pool; the proxy
+// switches away from it on the next request, so it is safe even on the active account.
+async function toggleEnabled(name, enable, e) {
+  if (e) e.stopPropagation();
+  const btn = e && e.currentTarget ? e.currentTarget : null;
+  if (btn) btn.disabled = true; // guard against double-clicks while the POST is in flight
+  try {
+    const resp = await fetch('/api/account-enabled', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ name, enabled: enable })
+    });
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || 'failed');
+    showToast(data.enabled ? name + ' re-enabled' : name + ' disabled — excluded from rotation');
+    refresh(); // re-render from the server so the card state can't drift from disk
+  } catch(err) {
+    if (btn) btn.disabled = false;
+    showToast('Enable/disable failed: ' + err.message);
+  }
+}
+
+/**
+ * Give this account its own cap, or take it away.
+ *
+ * Turning it on seeds both windows from the global cap when there is one, so the
+ * account starts where it already effectively was, and from 75% otherwise.
+ * Turning it off clears the override — which hands the account back to the global
+ * cap if one exists, rather than necessarily removing every limit. The row says
+ * which of the two happened.
+ */
+async function toggleAccountCap(name, hasOwn, e) {
+  if (e) e.stopPropagation();
+  const btn = e && e.currentTarget ? e.currentTarget : null;
+  if (btn) btn.disabled = true;
+  const g5 = Number(document.getElementById('cap-5h')?.value) || null;
+  const g7 = Number(document.getElementById('cap-7d')?.value) || null;
+  const body = hasOwn
+    ? { name, fiveH: null, sevenD: null }
+    : { name, fiveH: g5 || 75, sevenD: g7 || 75 };
+  try {
+    const resp = await fetch('/api/account-cap', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || 'failed');
+    showToast(hasOwn
+      ? name + ': tetto proprio rimosso' + ((g5 || g7) ? ' — torna a valere il globale' : '')
+      : name + ': tetto ' + body.fiveH + '% / ' + body.sevenD + '%');
+    refresh();
+  } catch (err) {
+    if (btn) btn.disabled = false;
+    showToast('Tetto non salvato: ' + err.message);
+  }
+}
+
+/** Set (or clear, with an empty box) one window's cap on one account. */
+async function setAccountCap(name, win, value, e) {
+  if (e) e.stopPropagation();
+  const raw = String(value).trim();
+  // Empty is meaningful — it clears the override so the global cap applies again.
+  const pct = raw === '' ? null : Math.round(Number(raw));
+  if (pct !== null && (!Number.isFinite(pct) || pct < 1 || pct > 99)) {
+    showToast('Il tetto va da 1 a 99% — lascia vuoto per ereditare il globale');
+    refresh();
+    return;
+  }
+  try {
+    const resp = await fetch('/api/account-cap', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ name, [win]: pct })
+    });
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || 'failed');
+    const w = win === 'fiveH' ? '5h' : '7g';
+    showToast(pct === null ? name + ': tetto ' + w + ' → globale' : name + ': tetto ' + w + ' → ' + pct + '%');
+    refresh();
+  } catch (err) {
+    showToast('Tetto non salvato: ' + err.message);
+    refresh();
+  }
+}
+
 async function doRefresh(name, e) {
   if (e) e.stopPropagation();
   try {
@@ -2875,7 +4031,7 @@ async function refresh() {
     }
     document.getElementById('account-count').textContent = profiles.length;
     if (rotationStrategy) {
-      const strategyNames = { sticky: 'Sticky', conserve: 'Conserve', 'round-robin': 'Round-robin', spread: 'Spread', 'drain-first': 'Drain first', balance: 'Balance' };
+      const strategyNames = { sticky: 'Sticky', conserve: 'Conserve', 'round-robin': 'Round-robin', spread: 'Spread', 'drain-first': 'Drain first', balance: 'Balance', priority: 'Priority' };
       document.getElementById('current-strategy').textContent = ' \\u00b7 ' + (strategyNames[rotationStrategy] || rotationStrategy);
     }
     if (probeStats) renderProbeStats(probeStats);
@@ -2929,6 +4085,126 @@ async function refresh() {
   }
 }
 
+function fmtTokens(n) {
+  if (!n) return '0';
+  if (n >= 1e9) return (n / 1e9).toFixed(1).replace(/\\.0$/, '') + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\\.0$/, '') + 'M';
+  if (n >= 1e3) return Math.round(n / 1e3) + 'k';
+  return String(n);
+}
+
+// List-price value in euro. Deliberately NOT called "cost": these are flat-rate
+// subscription accounts, so no euro here is actually spent — it's what the same
+// traffic would have cost on the metered API, i.e. what the subscription returned.
+function fmtEur(usd) {
+  const eur = usd * (window.__usdEur || 0.92);
+  if (eur === 0) return '€0';
+  if (eur < 0.01) return '<€0,01';
+  if (eur < 100) return '€' + eur.toFixed(2).replace('.', ',');
+  return '€' + Math.round(eur).toLocaleString('it-IT');
+}
+
+/**
+ * The chronological strip: one cell per time slice, oldest on the left.
+ *
+ * Cell state is deliberately three-valued. "unknown" is not a third category —
+ * it means no utilization sample covers that slice, so we cannot say whether the
+ * account moved. Painting it as either mine or external would be a guess.
+ */
+function renderAttrStrip(win) {
+  if (!win || !win.bands || !win.bands.length) return '';
+  const peak = win.bands.reduce((m, b) => Math.max(m, b.myTokens), 0);
+  const cells = win.bands.map(b => {
+    let cls, title;
+    const when = new Date(b.to).toLocaleString('it-IT', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+    if (b.myTokens > 0) {
+      cls = 'attr-mine';
+      title = when + ' — ' + fmtTokens(b.myTokens) + ' token passati da VDM, cache inclusa (' + b.requests + ' richieste), ' + fmtEur(b.myCostUsd);
+    } else if (b.deltaUtil === null) {
+      cls = 'attr-unknown';
+      title = when + ' — nessuna misura di utilization: non so se l\\'account si è mosso';
+    } else if (b.deltaUtil > 0) {
+      cls = 'attr-ext';
+      title = when + ' — +' + Math.round(b.deltaUtil * 100) + '% di utilization senza traffico da qui: uso esterno';
+    } else {
+      cls = 'attr-idle';
+      title = when + ' — fermo';
+    }
+    // Opacity carries magnitude within the "mine" cells so a busy slice reads
+    // heavier than a single request; the floor keeps every cell visible.
+    const style = (cls === 'attr-mine' && peak > 0)
+      ? ' style="opacity:' + (0.35 + 0.65 * (b.myTokens / peak)).toFixed(2) + '"'
+      : '';
+    return '<div class="attr-cell ' + cls + '"' + style + ' title="' + escHtml(title) + '"></div>';
+  }).join('');
+  return '<div class="attr-strip">' + cells + '</div>';
+}
+
+/**
+ * The figures the strip is a picture of — per window, so this sits in the column.
+ *
+ * Kept deliberately short: these render inside a ~150px column on a narrow window,
+ * and the long-form detail belongs in the tooltip, not wrapped across six lines.
+ */
+function renderAttrFigures(win) {
+  if (!win) return '';
+  const breakdown = win.tokenBreakdown || {};
+  const direct = (breakdown.inputTokens || 0) + (breakdown.outputTokens || 0);
+  const cache = (breakdown.cacheReadTokens || 0) + (breakdown.cacheCreationTokens || 0);
+  const trafficTitle = 'Questo totale è il traffico registrato da VDM: input, output, cache letta e cache creata. Non è il saldo dell\\'account né la sua quota Anthropic.';
+  const breakdownTitle = 'I/O = token di input e output. Cache = token letti o creati nella cache; in una sessione lunga vengono conteggiati a ogni richiesta.';
+  const share = win.externalShare;
+  let verdict;
+  if (share === null) {
+    verdict = '<span class="dim">quota esterna non misurata</span>';
+  } else if (win.coverage < 0.25) {
+    verdict = '<span class="dim">misurato al ' + Math.round(win.coverage * 100) + '%: ~' +
+      Math.round(share * 100) + '% da fuori</span>';
+  } else {
+    verdict = '<strong>' + Math.round((1 - share) * 100) + '% mio</strong>' +
+      '<span class="dim"> · ' + Math.round(share * 100) + '% da fuori</span>';
+  }
+  const detail = win.requests + ' richieste misurate da qui' +
+    (win.coverage > 0 ? ', quota esterna calcolata sul ' + Math.round(win.coverage * 100) + '% della finestra' : '');
+  return '<div class="attr-figure" title="' + escHtml(detail) + '">' +
+      fmtTokens(win.myTokens) + ' <span class="dim" title="' + trafficTitle + '">token passati da VDM · ' + fmtEur(win.myCostUsd) + ' a listino</span>' +
+    '</div>' +
+    (win.myTokens > 0 ? '<div class="attr-breakdown" title="' + breakdownTitle + '">' +
+      fmtTokens(direct) + ' I/O · ' + fmtTokens(cache) + ' cache</div>' : '') +
+    '<div class="attr-figure">' + verdict + '</div>';
+}
+
+/**
+ * The legend, once per card rather than once per window.
+ *
+ * It used to render inside each rate-group, which meant two identical copies per
+ * card competing for a narrow column — at 390px that alone was six wrapped lines.
+ * Identity is still never colour-alone; the labels just aren't duplicated.
+ */
+function renderAttrLegend() {
+  return '<div class="attr-legend">' +
+    '<span class="lg"><span class="key attr-mine"></span>misurato qui</span>' +
+    '<span class="lg"><span class="key attr-ext"></span>uso esterno</span>' +
+    '<span class="lg"><span class="key attr-unknown"></span>non misurato</span>' +
+  '</div>';
+}
+
+/** The tick drawn on the utilization track where the cap sits. */
+function renderCapMarker(capPct, over) {
+  if (capPct === null || capPct === undefined) return '';
+  return '<div class="cap-marker' + (over ? ' hit' : '') + '" ' +
+    'style="left:' + Math.min(capPct, 100) + '%" ' +
+    'title="Tetto impostato: oltre il ' + capPct + '% VDM smette di scegliere questo account"></div>';
+}
+
+/** The cap value, in the header beside the utilization it is measured against. */
+function renderCapLabel(capPct, over) {
+  if (capPct === null || capPct === undefined) return '';
+  return '<span class="rate-cap' + (over ? ' hit' : '') + '" ' +
+    'title="Tetto impostato: oltre il ' + capPct + '% VDM smette di scegliere questo account">' +
+    'cap ' + capPct + '%</span>';
+}
+
 function renderAccounts(profiles, animate) {
   const el = document.getElementById('accounts');
   if (!profiles.length) {
@@ -2940,6 +4216,84 @@ function renderAccounts(profiles, animate) {
     const displayName = p.label || p.name;
     const eName = p.name.replace(/'/g, "\\\\'");
     const tok = tokenStatus(p.expiresAt);
+    const prioVal = Number.isFinite(p.priority) ? p.priority : 0;
+    const isOff = !!p.disabled;
+    const enableHtml =
+      '<div class="enable-wrap" title="' +
+        (isOff ? 'Disabled: excluded from rotation. Click to re-enable.'
+               : 'Enabled: in the rotation pool. Click to exclude it.') + '">' +
+        '<span class="enable-cap">' + (isOff ? 'OFF' : 'ON') + '</span>' +
+        '<button class="enable-sw' + (isOff ? '' : ' on') + '" ' +
+          'aria-label="' + (isOff ? 'Enable' : 'Disable') + ' ' + displayName + '" ' +
+          'onclick="toggleEnabled(\\''+eName+'\\','+(isOff ? 'true' : 'false')+',event)"></button>' +
+      '</div>';
+    const priorityRow = (capRowHtml) =>
+      '<div class="card-priority">' +
+        '<span class="prio-group" title="Higher = preferred first. Used by the Priority rotation strategy.">' +
+          '<span class="prio-cap">Priority</span>' +
+          '<button class="prio-btn" onclick="bumpPriority(\\''+eName+'\\',-1,event)">-</button>' +
+          '<span class="prio-val">' + prioVal + '</span>' +
+          '<button class="prio-btn" onclick="bumpPriority(\\''+eName+'\\',1,event)">+</button>' +
+        '</span>' +
+        capRowHtml +
+        enableHtml +
+      '</div>';
+    const offMsg = isOff
+      ? '<div class="off-msg">Excluded from rotation — the proxy will not pick this account.</div>'
+      : '';
+    const extraUsageBlocked = p.blockKind === 'extra-usage';
+    const extraUsageMsg = extraUsageBlocked
+      ? '<div class="extra-usage-msg">Extra usage exhausted. The 5h and weekly bars are plan limits, not the third-party allowance used by jcode.</div>'
+      : '';
+
+    // Per-account cap override. Empty means "inherit the global cap", which the
+    // placeholder shows, so an empty box is never ambiguous between "no cap" and
+    // "the global one applies".
+    const capCfg = p.cap || { override: {}, effective: {} };
+    const ov = capCfg.override || {};
+    const eff = capCfg.effective || {};
+    // "Has its own cap" is what the switch reflects — not "is capped". Those come
+    // apart when a global cap exists: switching this off does NOT remove the cap,
+    // it hands the account back to the global one. The row says which case it is
+    // rather than leaving an off switch looking like "no limit".
+    const hasOwnCap = (ov.fiveH !== null && ov.fiveH !== undefined) ||
+                      (ov.sevenD !== null && ov.sevenD !== undefined);
+    const capField = (win, label) => {
+      const own = ov[win];
+      const e = eff[win];
+      const ph = (e === null || e === undefined) ? 'off' : e + '%';
+      // The % lives in the wrapper, not in the field's value: a number input
+      // cannot hold a unit, and putting one in a text field would mean parsing it
+      // back out on every edit.
+      return '<span class="cap-lab">' + label + '</span>' +
+        '<span class="cap-field">' +
+          '<input class="cap-in" type="number" min="1" max="99" ' +
+            'value="' + (own === null || own === undefined ? '' : own) + '" placeholder="' + ph.replace('%', '') + '" ' +
+            'title="Tetto di questo account sulla finestra ' + label + '. Vuoto = solo l\\'altra finestra è limitata." ' +
+            'onchange="setAccountCap(\\''+eName+'\\',\\''+win+'\\',this.value,event)">' +
+          '<span class="cap-pct">%</span>' +
+        '</span>';
+    };
+    let capBody;
+    if (hasOwnCap) {
+      capBody = capField('fiveH', '5h') + capField('sevenD', '7g');
+    } else if (eff.fiveH != null || eff.sevenD != null) {
+      capBody = '<span class="cap-note">eredita il globale (' +
+        (eff.fiveH != null ? '5h ' + eff.fiveH + '%' : '') +
+        (eff.fiveH != null && eff.sevenD != null ? ' · ' : '') +
+        (eff.sevenD != null ? '7g ' + eff.sevenD + '%' : '') + ')</span>';
+    } else {
+      capBody = '<span class="cap-note">nessun tetto</span>';
+    }
+    const capRow = '<span class="cap-row" title="Oltre il tetto VDM smette di scegliere questo account, e riprende da solo quando la finestra si azzera.">' +
+      '<span class="cap-lab">Tetto</span>' +
+      '<button class="enable-sw' + (hasOwnCap ? ' on' : '') + '" ' +
+        'aria-label="' + (hasOwnCap ? 'Togli' : 'Metti') + ' un tetto su ' + displayName + '" ' +
+        'title="' + (hasOwnCap ? 'Togli il tetto di questo account' : 'Metti un tetto solo su questo account') + '" ' +
+        'onclick="toggleAccountCap(\\''+eName+'\\','+(hasOwnCap ? 'true' : 'false')+',event)"></button>' +
+      capBody +
+      (capCfg.over ? '<span class="cap-hit">raggiunto</span>' : '') +
+    '</span>';
 
     let barsHtml = '';
     if (p.rateLimits) {
@@ -2959,20 +4313,30 @@ function renderAccounts(profiles, animate) {
         renderSparkline(hist7d, 'u7d', 7*24*60*60*1000, 'days') +
         '</div>';
 
+      const cap = p.cap || { effective: {}, over5h: false, over7d: false };
+      const attr = p.attribution || {};
+
       barsHtml = '<div class="rate-bars">' +
         '<div class="rate-group">' +
-          '<div class="rate-head"><span class="rate-label">5h window</span><span class="rate-pct ' + pctClass(f) + '">' + f + '%</span></div>' +
-          '<div class="rate-track"><div class="rate-fill ' + fillClass(rl.fiveH.utilization) + '" style="width:' + Math.min(f,100) + '%"></div></div>' +
+          '<div class="rate-head"><span class="rate-label" title="Claude plan rate-limit window; not Extra Usage">Plan 5h</span><span>' + renderCapLabel(cap.effective.fiveH, cap.over5h) + '<span class="rate-pct ' + pctClass(f) + '">' + f + '%</span></span></div>' +
+          '<div class="rate-track"><div class="rate-fill ' + fillClass(rl.fiveH.utilization) + '" style="width:' + Math.min(f,100) + '%"></div>' +
+            renderCapMarker(cap.effective.fiveH, cap.over5h) + '</div>' +
           '<div class="rate-reset" data-reset="' + rl.fiveH.reset + '">' + formatTimeLeft(rl.fiveH.reset) + '</div>' +
+          renderAttrStrip(attr.fiveH) +
+          renderAttrFigures(attr.fiveH) +
           spark5h +
         '</div>' +
         '<div class="rate-group">' +
-          '<div class="rate-head"><span class="rate-label">Weekly</span><span class="rate-pct ' + pctClass(s) + '">' + s + '%</span></div>' +
-          '<div class="rate-track"><div class="rate-fill ' + fillClass(rl.sevenD.utilization) + '" style="width:' + Math.min(s,100) + '%"></div></div>' +
+          '<div class="rate-head"><span class="rate-label" title="Claude plan rate-limit window; not Extra Usage">Plan weekly</span><span>' + renderCapLabel(cap.effective.sevenD, cap.over7d) + '<span class="rate-pct ' + pctClass(s) + '">' + s + '%</span></span></div>' +
+          '<div class="rate-track"><div class="rate-fill ' + fillClass(rl.sevenD.utilization) + '" style="width:' + Math.min(s,100) + '%"></div>' +
+            renderCapMarker(cap.effective.sevenD, cap.over7d) + '</div>' +
           '<div class="rate-reset" data-reset="' + rl.sevenD.reset + '">' + formatTimeLeft(rl.sevenD.reset) + '</div>' +
+          renderAttrStrip(attr.sevenD) +
+          renderAttrFigures(attr.sevenD) +
           spark7d +
         '</div>' +
-      '</div>';
+      '</div>' +
+      renderAttrLegend();
     } else if (p.dormant) {
       barsHtml = '<div style="font-size:0.8125rem;color:var(--cyan);margin-top:0.25rem;font-weight:500">Dormant  - window preserved</div>';
     } else {
@@ -2989,12 +4353,15 @@ function renderAccounts(profiles, animate) {
         staleMsg = '<div class="stale-msg">Token expired. Auto-refresh will retry shortly.</div>';
       }
     }
-    var cardClass = 'card' + (active ? ' active' : '') + (isStale ? ' stale' : '');
+    var cardClass = 'card' + (active ? ' active' : '') + (isStale ? ' stale' : '') + (isOff ? ' off' : '');
     var buttonsHtml = '';
     if (!active) {
       buttonsHtml = '<div style="margin-top:0.875rem;display:flex;justify-content:space-between;align-items:center">' +
         '<button class="remove-btn" onclick="doRemove(\\''+eName+'\\',event)">Remove</button>' +
-        (isStale ? '<button class="refresh-btn" onclick="doRefresh(\\''+eName+'\\',event)">Refresh</button>' : '<button class="switch-btn" onclick="doSwitch(\\''+eName+'\\',\\''+displayName.replace(/'/g, "\\\\'")+'\\''+',event)">Switch to this account</button>') +
+        // No "Switch to this account" while disabled: the proxy would drop it again on
+        // the next request. Re-enable it with the switch above first.
+        (isStale ? '<button class="refresh-btn" onclick="doRefresh(\\''+eName+'\\',event)">Refresh</button>'
+                 : (isOff ? '' : '<button class="switch-btn" onclick="doSwitch(\\''+eName+'\\',\\''+displayName.replace(/'/g, "\\\\'")+'\\''+',event)">Switch to this account</button>')) +
       '</div>';
     }
     return '<div class="' + cardClass + '"' + animStyle + '>' +
@@ -3006,10 +4373,18 @@ function renderAccounts(profiles, animate) {
         '</div>' +
         '<div class="card-badges">' +
           planBadge(p.subscriptionType, p.rateLimitTier) +
+          (capCfg.over ? '<span class="badge" style="background:var(--yellow-soft);color:var(--yellow);border:1px solid var(--yellow-border)">Cap raggiunto</span>' : '') +
+          (isOff ? '<span class="badge badge-off">Disabled</span>' : '') +
+          (extraUsageBlocked ? '<span class="badge badge-extra-usage">Extra usage exhausted</span>' : '') +
           (active ? '<span class="badge badge-active">Active</span>' : '') +
         '</div>' +
       '</div>' +
       barsHtml +
+      extraUsageMsg +
+      // The cap control sits on the priority row: both are knobs that decide whether this
+      // account gets picked, so they belong together rather than split across the card.
+      priorityRow(capRow) +
+      offMsg +
       staleMsg +
       buttonsHtml +
     '</div>';
@@ -3023,6 +4398,7 @@ const evtColors = {
   'manual-switch': 'var(--primary)', 'rate-limited': 'var(--yellow)',
   'auth-expired': 'var(--red)', 'all-exhausted': 'var(--red)',
   'account-discovered': 'var(--green)', 'account-renamed': 'var(--muted)',
+  'account-enabled': 'var(--muted)',
   'settings-changed': 'var(--muted)',
   'upgrade': 'var(--green)',
   'refresh-failed': 'var(--red)', 'token-refreshed': 'var(--green)',
@@ -3042,6 +4418,7 @@ function evtMsg(e) {
     case 'upgrade': return 'Upgraded to <b>' + (e.to||'?') + '</b>';
     case 'refresh-failed': return '<b>' + (e.account||'?') + '</b> refresh failed: ' + (e.error||'unknown');
     case 'token-refreshed': return '<b>' + (e.account||'?') + '</b> token refreshed';
+    case 'account-enabled': return '<b>' + (e.name||'?') + '</b> ' + (e.enabled ? 're-enabled' : 'disabled — excluded from rotation');
     default: return e.type;
   }
 }
@@ -3122,6 +4499,7 @@ const STRATEGY_HINTS = {
   spread: 'Picks the least-used account on every request. Switches often  - may trigger Anthropic notices.',
   'drain-first': 'Uses the account with highest 5hr utilization first. Good for short sessions.',
   balance: 'Spreads concurrent requests across accounts, capped per account. Best for running many sessions at once  - avoids per-account rate limits.',
+  priority: 'Prefers your highest-priority account. Falls over to the next one on a rate limit, and switches back as soon as the preferred account recovers. Set each account\\'s priority on its card.',
 };
 
 async function loadSettingsUI() {
@@ -3130,6 +4508,17 @@ async function loadSettingsUI() {
     document.getElementById('toggle-proxy').checked = s.proxyEnabled;
     document.getElementById('toggle-autoswitch').checked = s.autoSwitch;
     document.getElementById('toggle-notifs').checked = s.notifications !== false;
+    // Caps: null is a real value here (no cap), and an empty box is how it shows.
+    const cap5 = document.getElementById('cap-5h');
+    const cap7 = document.getElementById('cap-7d');
+    if (cap5) cap5.value = (s.usageCap5h === null || s.usageCap5h === undefined) ? '' : s.usageCap5h;
+    if (cap7) cap7.value = (s.usageCap7d === null || s.usageCap7d === undefined) ? '' : s.usageCap7d;
+    const hold = document.getElementById('sel-cap-hold');
+    if (hold) hold.value = String(s.usageCapHoldMin === undefined ? 10 : s.usageCapHoldMin);
+    // Cards render euro figures from this, so it has to be in scope before they draw.
+    window.__usdEur = s.usdEur || 0.92;
+    const fx = document.getElementById('cfg-usdeur');
+    if (fx) fx.value = window.__usdEur;
     document.getElementById('sel-strategy').value = s.rotationStrategy || 'conserve';
     document.getElementById('sel-interval').value = s.rotationIntervalMin || 60;
     document.getElementById('sel-max-concurrent').value = s.maxConcurrentPerAccount || 8;
@@ -3152,6 +4541,7 @@ const STRATEGY_DETAILS = {
   spread:        { name: 'Spread',      desc: 'Always pick the account with the lowest 5hr utilization on every request. Switches often  - best for short, bursty sessions.' },
   'drain-first': { name: 'Drain first', desc: 'Use the account with the highest 5hr utilization first, draining it before moving on. Good for finishing off nearly-exhausted windows.' },
   balance:       { name: 'Balance',     desc: 'Spread concurrent requests across accounts by least in-flight count, capped per account. When all accounts hit the cap it briefly waits for a free slot, then overflows rather than dropping. Best when running many sessions/subagents at once  - divides per-minute load so no single account gets throttled.' },
+  priority:      { name: 'Priority',    desc: 'Always run on your highest-priority available account. When it hits a rate limit, fail over to the next priority; as soon as the preferred account recovers, switch back up. Set each account\\'s priority (higher = preferred) on its card. Ties break by lowest 5hr utilization.' },
 };
 
 function updateStrategyUI(strategy) {
@@ -3200,6 +4590,65 @@ async function changeSerializeDelay(value) {
   } catch { showToast('Failed to update'); }
 }
 
+/** Global cap for one window. An empty box clears it. */
+async function changeGlobalCap(field, value) {
+  const raw = String(value).trim();
+  const pct = raw === '' ? null : Math.round(Number(raw));
+  if (pct !== null && (!Number.isFinite(pct) || pct < 1 || pct > 99)) {
+    showToast('Il tetto va da 1 a 99% — lascia vuoto per toglierlo');
+    loadSettings();
+    return;
+  }
+  try {
+    await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ [field]: pct })
+    });
+    const w = field === 'usageCap5h' ? '5h' : 'settimanale';
+    showToast(pct === null ? 'Tetto ' + w + ' rimosso' : 'Tetto ' + w + ': ' + pct + '%');
+    refresh(); // cap markers on the cards move with it
+  } catch { showToast('Failed to update'); }
+}
+
+async function changeUsdEur(value) {
+  const rate = Number(value);
+  if (!Number.isFinite(rate) || rate <= 0 || rate > 10) {
+    showToast('Cambio non valido');
+    loadSettings();
+    return;
+  }
+  try {
+    await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ usdEur: rate })
+    });
+    window.__usdEur = rate;
+    showToast('Cambio: 1 USD = ' + rate + ' EUR');
+    refresh();
+  } catch { showToast('Failed to update'); }
+}
+
+// Minutes read fine up to an hour and stop reading past it: "1440 min" is a number
+// you have to divide before you know what you agreed to.
+function fmtHoldMin(min) {
+  if (min < 60) return min + ' min';
+  var h = min / 60;
+  return (Number.isInteger(h) ? h : h.toFixed(1)) + (h === 1 ? ' ora' : ' ore');
+}
+
+async function changeCapHold(min) {
+  try {
+    await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ usageCapHoldMin: min })
+    });
+    showToast(min === 0 ? 'Attesa disattivata: 429 immediato' : 'Attesa massima: ' + fmtHoldMin(min));
+  } catch { showToast('Failed to update'); }
+}
+
 async function changeStrategy(value) {
   try {
     await fetch('/api/settings', {
@@ -3243,12 +4692,22 @@ async function changeInterval(value) {
 
 var TOK_COLORS = ['var(--primary)', 'var(--purple)', 'var(--cyan)', 'var(--green)', 'var(--yellow)', 'var(--red)'];
 
+// Kept in step with MODEL_PRICING_USD on the server — same list prices, so the
+// Tokens tab and the per-account figures can't disagree. Longest prefix wins.
 var TOK_PRICING = {
-  'claude-opus-4-6': { input: 15, output: 75 },
+  'claude-fable-5':  { input: 10, output: 50 },
+  'claude-mythos-5': { input: 10, output: 50 },
+  'claude-opus-5':   { input: 5,  output: 25 },
+  'claude-opus-4-8': { input: 5,  output: 25 },
+  'claude-opus-4-7': { input: 5,  output: 25 },
+  'claude-opus-4-6': { input: 5,  output: 25 },
+  'claude-opus-4-5': { input: 5,  output: 25 },
+  'claude-sonnet-5': { input: 3,  output: 15 },
   'claude-sonnet-4-6': { input: 3, output: 15 },
-  'claude-haiku-4-5': { input: 0.80, output: 4 },
+  'claude-sonnet-4-5': { input: 3, output: 15 },
+  'claude-haiku-4-5':  { input: 1, output: 5 },
 };
-var TOK_PRICING_DEFAULT = { input: 3, output: 15 };
+var TOK_PRICING_DEFAULT = { input: 5, output: 25 };
 var TOK_PLANS = {
   'pro':    { label: 'Pro ($20/mo)', monthly: 20 },
   'max5x':  { label: 'MAX 5x ($100/mo)', monthly: 100 },
@@ -3257,10 +4716,17 @@ var TOK_PLANS = {
 var _tokPrevPeriodData = [];
 var _tokRepoCollapsed = {};
 
-function estimateCost(model, inTok, outTok) {
-  var key = Object.keys(TOK_PRICING).find(function(k) { return model && model.indexOf(k) === 0; });
+function estimateCost(model, inTok, outTok, cacheReadTok, cacheWriteTok) {
+  // Longest prefix wins: claude-opus-4-8 must not resolve via a shorter key.
+  var key = null;
+  Object.keys(TOK_PRICING).forEach(function(k) {
+    if (model && model.indexOf(k) === 0 && (!key || k.length > key.length)) key = k;
+  });
   var p = key ? TOK_PRICING[key] : TOK_PRICING_DEFAULT;
-  return (inTok / 1e6) * p.input + (outTok / 1e6) * p.output;
+  return (inTok / 1e6) * p.input
+    + (outTok / 1e6) * p.output
+    + ((cacheReadTok || 0) / 1e6) * p.input * 0.1
+    + ((cacheWriteTok || 0) / 1e6) * p.input * 1.25;
 }
 
 function formatCost(dollars) {
@@ -3434,7 +4900,7 @@ function renderTokenStats(data, prevData) {
     var outT = data[i].outputTokens || 0;
     totalIn += inT;
     totalOut += outT;
-    totalCost += estimateCost(data[i].model, inT, outT);
+    totalCost += estimateCost(data[i].model, inT, outT, data[i].cacheReadTokens || 0, data[i].cacheCreationTokens || 0);
     requests++;
   }
   var trendHtml = '';
@@ -3690,7 +5156,7 @@ function renderCostSavingsChart() {
     var idx = Math.floor(elapsed / dayMs);
     if (idx >= bucketCount) idx = bucketCount - 1;
     if (idx < 0) idx = 0;
-    dailyCosts[idx] += estimateCost(data[i].model, data[i].inputTokens || 0, data[i].outputTokens || 0);
+    dailyCosts[idx] += estimateCost(data[i].model, data[i].inputTokens || 0, data[i].outputTokens || 0, data[i].cacheReadTokens || 0, data[i].cacheCreationTokens || 0);
   }
 
   // Accumulate
@@ -3792,7 +5258,7 @@ function renderAccountBreakdown(data) {
     accountMap[acct].input += inT;
     accountMap[acct].output += outT;
     accountMap[acct].total += inT + outT;
-    accountMap[acct].cost += estimateCost(data[i].model, inT, outT);
+    accountMap[acct].cost += estimateCost(data[i].model, inT, outT, data[i].cacheReadTokens || 0, data[i].cacheCreationTokens || 0);
   }
   var sortedAccounts = Object.keys(accountMap).sort(function(a,b) { return accountMap[b].total - accountMap[a].total; });
   if (!sortedAccounts.length) { el.innerHTML = ''; return; }
@@ -4272,8 +5738,8 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`Dashboard running at http://localhost:${PORT}`);
+server.listen(PORT, HOST, () => {
+  console.log(`Dashboard running at http://${HOST}:${PORT}`);
   // Discover any existing keychain token on startup so the dashboard
   // shows accounts immediately (don't wait for the first proxy request)
   autoDiscoverAccount().catch(() => {});
@@ -4290,7 +5756,7 @@ server.listen(PORT, () => {
 //  2. Forwards to api.anthropic.com
 //  3. On 429 → auto-retries with next account
 //  4. On 401 → marks token expired, tries next
-//  5. On 529 → returns as-is (server overload)
+//  5. On Claude capacity errors → bounded retry on the same account
 //  6. Tracks per-account rate-limit state from
 //     every response's headers
 // ─────────────────────────────────────────────────
@@ -4309,9 +5775,9 @@ const LOG_BUFFER_MAX = 2000;
 
 function log(tag, msg, extra = '') {
   const ts = new Date().toLocaleTimeString('en-GB', { hour12: false });
-  const line = `[${ts}] [${tag}] ${msg}${extra ? ' ' + extra : ''}`;
+  const line = redactSecrets(`[${ts}] [${tag}] ${msg}${extra ? ' ' + extra : ''}`);
   try { console.log(line); } catch { /* stdout broken (EIO/EPIPE) — ignore */ }
-  const entry = { ts, tag, msg: msg + (extra ? ' ' + extra : ''), line };
+  const entry = { ts, tag, msg: redactSecrets(msg + (extra ? ' ' + extra : '')), line };
   // Buffer for replay to new SSE clients
   _logBuffer.push(entry);
   if (_logBuffer.length > LOG_BUFFER_MAX) _logBuffer.shift();
@@ -4393,11 +5859,22 @@ function savePersistedState() {
 }
 
 function updatePersistedState(fingerprint, data) {
+  // Merge with the existing row: callers may pass only some fields (e.g.
+  // markAccountLimited persists just limited/retryAfter and must not wipe the
+  // utilization numbers). A field is only overwritten when explicitly provided.
+  const prev = persistedState[fingerprint] || {};
+  const pick = (k, d) => (data[k] !== undefined ? data[k] : (prev[k] !== undefined ? prev[k] : d));
   persistedState[fingerprint] = {
-    utilization5h: data.utilization5h || 0,
-    utilization7d: data.utilization7d || 0,
-    resetAt: data.resetAt || 0,
-    resetAt7d: data.resetAt7d || 0,
+    utilization5h: pick('utilization5h', 0),
+    utilization7d: pick('utilization7d', 0),
+    resetAt: pick('resetAt', 0),
+    resetAt7d: pick('resetAt7d', 0),
+    // A hard 429 cooldown, persisted so it survives a proxy restart (otherwise a
+    // kickstart forgets it and re-tries the limited account until it 429s again).
+    limited: pick('limited', false),
+    retryAfter: pick('retryAfter', 0),
+    // A low plan-window percentage can still be blocked by Extra Usage.
+    blockKind: pick('blockKind', null),
     updatedAt: Date.now(),
   };
   savePersistedState();
@@ -4429,13 +5906,31 @@ loadPersistedState();
 // Server-side sparkline cache (cleared on window resets to force re-render)
 const _sparkCache = {};
 
-function updateAccountState(token, name, headers, fingerprint) {
-  accountState.update(token, name, headers);
+function updateAccountState(token, name, headers, fingerprint, options) {
+  accountState.update(token, name, headers, options);
   if (fingerprint) {
-    const u5h = parseFloat(headers['anthropic-ratelimit-unified-5h-utilization'] || '0');
-    const u7d = parseFloat(headers['anthropic-ratelimit-unified-7d-utilization'] || '0');
-    const reset7d = Number(headers['anthropic-ratelimit-unified-7d-reset'] || 0);
-    const reset5h = Number(headers['anthropic-ratelimit-unified-5h-reset'] || 0);
+    // A response can be a perfectly good 200 and still say nothing about limits:
+    // /v1/messages/count_tokens carries none of the unified headers, and neither
+    // does a 400 the gateway answers itself. `accountState.update()` already
+    // guards against that (it keeps the whole last reading), but this branch used
+    // to read every field with `|| '0'` and then persist the result — so one
+    // count_tokens call overwrote a real 54% / real reset epoch with 0 and 0.
+    // Zero reset is what the card renders as "rolling window", and the zeroed
+    // utilization also fed the usage-cap check, which would re-elect a capped
+    // account. Preserve field by field, exactly like lib.mjs does.
+    const RL = {
+      u5h: 'anthropic-ratelimit-unified-5h-utilization',
+      u7d: 'anthropic-ratelimit-unified-7d-utilization',
+      r5h: 'anthropic-ratelimit-unified-5h-reset',
+      r7d: 'anthropic-ratelimit-unified-7d-reset',
+    };
+    if (!Object.values(RL).some(k => headers[k] !== undefined)) return;
+    const known = persistedState[fingerprint] || {};
+    const keep = (key, prev, parse) => (headers[key] !== undefined ? parse(headers[key]) : (prev ?? 0));
+    const u5h = keep(RL.u5h, known.utilization5h, parseFloat);
+    const u7d = keep(RL.u7d, known.utilization7d, parseFloat);
+    const reset7d = keep(RL.r7d, known.resetAt7d, Number);
+    const reset5h = keep(RL.r5h, known.resetAt, Number);
 
     // Detect window resets using actual reset timestamps from API headers.
     // Rolling windows advance the reset epoch by seconds on each request,
@@ -4455,13 +5950,74 @@ function updateAccountState(token, name, headers, fingerprint) {
 
     utilizationHistory.record(fingerprint, u5h, u7d);
     weeklyHistory.record(fingerprint, u5h, u7d);
-    updatePersistedState(fingerprint, { utilization5h: u5h, utilization7d: u7d, resetAt: reset5h, resetAt7d: reset7d });
+    // Persist the in-memory limited/retryAfter too (update() preserves an active
+    // cooldown across probes), so a restart hydrates the real availability.
+    const st = accountState.get(token) || {};
+    updatePersistedState(fingerprint, { utilization5h: u5h, utilization7d: u7d, resetAt: reset5h, resetAt7d: reset7d, limited: st.limited || false, retryAfter: st.retryAfter || 0, blockKind: st.blockKind || null });
     saveHistoryToDisk();
   }
 }
 
-function markAccountLimited(token, name, retryAfterSec = 0) {
-  accountState.markLimited(token, name, retryAfterSec);
+/**
+ * Feed a fresh probe result back into the in-memory account state.
+ *
+ * Before this existed, `accountState.limited` could only be cleared by a real
+ * response flowing through the proxy for that account — but every picker skips a
+ * limited account, so no response could ever arrive. The account stayed out of
+ * rotation until the 5h window rolled over (`isAccountAvailable` falls back to
+ * `resetAt`, which is the window rollover, not an unblock time), while its card in
+ * the dashboard — fed by the probe, which writes only to `persistedState` — showed
+ * it perfectly healthy. That gap is the "VDM thinks it's blocked and it isn't" case.
+ *
+ * A real 429's retry-after still outranks the probe: `accountState.update()`
+ * preserves an active cooldown by design, because the probe uses a cheap model and
+ * therefore cannot see a per-model cap (the weekly Opus one). An 'allowed' here is
+ * not evidence that such a cooldown has lifted.
+ */
+function reconcileFromProbe(token, data) {
+  if (!data) return;
+  let name = accountState.get(token)?.name;
+  if (!name) {
+    // No prior state: adopt the probe as the account's first reading, so a cap can
+    // be enforced on an account that has never carried traffic through the proxy.
+    name = loadAllAccountTokens().find(a => a.token === token)?.name;
+    if (!name) return;
+  }
+  const prev = accountState.get(token);
+  const stillLimited = data.status === 'limited' || data.fiveH?.status === 'limited';
+  let fp = null;
+  try { fp = getFingerprintFromToken(token); } catch { /* unusable token */ }
+  // Forward the headers the probe actually received, rather than synthesising a
+  // full set with `?? 0` for the missing ones. Synthesising defeats the
+  // field-level preservation in accountState.update(): a 429 that carries only
+  // `unified-status` would arrive looking like a complete reading of 0%.
+  const headers = { 'anthropic-ratelimit-unified-status': stillLimited ? 'limited' : 'allowed' };
+  const seen = data.rateHeaders || {};
+  const copy = (key, value) => { if (seen[key] !== undefined) headers[key] = String(value); };
+  copy('anthropic-ratelimit-unified-5h-utilization', data.fiveH?.utilization);
+  copy('anthropic-ratelimit-unified-7d-utilization', data.sevenD?.utilization);
+  copy('anthropic-ratelimit-unified-5h-reset', data.fiveH?.reset);
+  copy('anthropic-ratelimit-unified-7d-reset', data.sevenD?.reset);
+  // A successful Haiku probe only observes plan-window limits. It cannot prove
+  // that Claude has restored the separate third-party Extra Usage allowance.
+  updateAccountState(token, name, headers, fp, { preserveExtraUsageMarker: true });
+  const now = Date.now();
+  const cooldown = accountState.get(token)?.retryAfter || 0;
+  if (prev?.limited && !stillLimited && cooldown <= now) {
+    log('probe', `${name}: probe reports allowed — clearing stale limited state (was blocking rotation)`);
+    wakeCapHolders(`${name} recovered`);
+  }
+}
+
+function markAccountLimited(token, name, retryAfterSec = 0, blockKind = 'model') {
+  accountState.markLimited(token, name, retryAfterSec, blockKind);
+  // Persist the cooldown (merged into the fingerprint's row) so a proxy restart
+  // doesn't forget it and re-try the account until it 429s again.
+  try {
+    const fp = getFingerprintFromToken(token);
+    const st = accountState.get(token) || {};
+    updatePersistedState(fp, { limited: true, retryAfter: st.retryAfter || 0, blockKind: st.blockKind || null });
+  } catch { /* best-effort persistence */ }
 }
 
 function markAccountExpired(token, name) {
@@ -4473,6 +6029,79 @@ function markAccountExpired(token, name) {
 let _accountsCache = null;
 let _accountsCacheAt = 0;
 const ACCOUNTS_CACHE_TTL = 5000; // 5s  - covers hot path without stale data
+
+// ── Per-account priority (sidecar `.priority`, used by the `priority` strategy) ──
+// Higher number = more preferred. Missing / invalid sidecar means priority 0.
+
+function readAccountPriority(name) {
+  try {
+    const raw = readFileSync(join(ACCOUNTS_DIR, `${name}.priority`), 'utf8').trim();
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function writeAccountPriority(name, priority) {
+  const n = parseInt(priority, 10);
+  const file = join(ACCOUNTS_DIR, `${name}.priority`);
+  if (!Number.isFinite(n) || n === 0) {
+    // 0 is the default — keep the accounts dir clean by removing the sidecar.
+    try { unlinkSync(file); } catch {}
+    return 0;
+  }
+  writeFileSync(file, String(n));
+  return n;
+}
+
+// ── Per-account enable/disable (sidecar `.disabled`) ──
+// Presence of the file = the account is opted out of the rotation pool (but not
+// removed). loadAllAccountTokens() tags each account with `disabled`, which the
+// pickers in lib.mjs treat as never-selectable. loadProfiles() still lists it so
+// the dashboard/tray can show it as disabled.
+function readAccountDisabled(name) {
+  return existsSync(join(ACCOUNTS_DIR, `${name}.disabled`));
+}
+
+function writeAccountDisabled(name, disabled) {
+  const file = join(ACCOUNTS_DIR, `${name}.disabled`);
+  if (disabled) {
+    writeFileSync(file, '');
+    return true;
+  }
+  try { unlinkSync(file); } catch {}
+  return false;
+}
+
+// ── Per-account usage cap (sidecar `.cap`) ──
+// `{ "fiveH": 40, "sevenD": null }` in percent. A null/missing field inherits the
+// global cap from settings, field by field, so an account can cap only its weekly
+// window. Same sidecar shape as `.priority` / `.disabled`.
+function readAccountCapOverride(name) {
+  try {
+    const raw = readFileSync(join(ACCOUNTS_DIR, `${name}.cap`), 'utf8');
+    const parsed = JSON.parse(raw);
+    return {
+      fiveH: sanitizeCapPercent(parsed?.fiveH),
+      sevenD: sanitizeCapPercent(parsed?.sevenD),
+    };
+  } catch {
+    return { fiveH: null, sevenD: null };
+  }
+}
+
+function writeAccountCapOverride(name, { fiveH, sevenD }) {
+  const clean = { fiveH: sanitizeCapPercent(fiveH), sevenD: sanitizeCapPercent(sevenD) };
+  const file = join(ACCOUNTS_DIR, `${name}.cap`);
+  if (clean.fiveH === null && clean.sevenD === null) {
+    // Both inherited — drop the sidecar so the accounts dir stays readable.
+    try { unlinkSync(file); } catch {}
+    return clean;
+  }
+  writeFileSync(file, JSON.stringify(clean));
+  return clean;
+}
 
 function loadAllAccountTokens() {
   const now = Date.now();
@@ -4489,8 +6118,19 @@ function loadAllAccountTokens() {
         const name = basename(file, '.json');
         let label = '';
         try { label = readFileSync(join(ACCOUNTS_DIR, `${name}.label`), 'utf8').trim(); } catch {}
+        const priority = readAccountPriority(name);
+        const disabled = readAccountDisabled(name);
         const expiresAt = creds.claudeAiOauth?.expiresAt || 0;
-        accounts.push({ name, label, token, creds, expiresAt });
+        // Resolve the caps here, once, so every picker in lib.mjs can read them off
+        // the account like `priority` and `disabled` instead of threading the
+        // settings object through six function signatures.
+        const capOverride = readAccountCapOverride(name);
+        const caps = resolveAccountCaps(capOverride, { fiveH: settings.usageCap5h, sevenD: settings.usageCap7d });
+        accounts.push({
+          name, label, token, creds, expiresAt, priority, disabled,
+          capFiveH: caps.fiveH, capSevenD: caps.sevenD, // 0..1, or null
+          capOverride,                                   // percent, for the UI
+        });
       } catch { /* skip corrupt */ }
     }
     _accountsCache = accounts;
@@ -4506,6 +6146,35 @@ function invalidateAccountsCache() {
   _accountsCacheAt = 0;
 }
 
+// Hydrate the in-memory state from disk on startup.
+//
+// It used to restore only hard cooldowns, so an account's utilization started at
+// 0 after every restart. That is not merely cosmetic: a response that omits the
+// utilization headers (a 429 routinely does) has nothing to preserve against, so
+// the zero sticks — and a blocked account never receives a response carrying full
+// headers, so it showed 0% indefinitely while the durable copy on disk said 100%.
+// The usage cap reads the same field, so it would also treat a full account as
+// empty. Restore the whole last-known reading, then re-apply active cooldowns.
+//
+// Runs after loadAllAccountTokens/_accountsCache are defined to avoid a TDZ.
+(function hydrateFromDisk() {
+  const now = Date.now();
+  let restored = 0;
+  try {
+    for (const acct of loadAllAccountTokens()) {
+      const fp = getFingerprintFromToken(acct.token);
+      const ps = persistedState[fp];
+      if (!ps) continue;
+      accountState.hydrate(acct.token, acct.name, ps);
+      restored++;
+      if (ps.retryAfter && ps.retryAfter > now) {
+        accountState.markLimited(acct.token, acct.name, Math.ceil((ps.retryAfter - now) / 1000), ps.blockKind || 'model');
+      }
+    }
+    if (restored) log('info', `Restored last-known rate-limit state for ${restored} account(s) from disk`);
+  } catch { /* best-effort */ }
+})();
+
 // ── Account picker ──
 
 function isAccountAvailable(token, expiresAt) {
@@ -4520,9 +6189,119 @@ function pickBestAccount(excludeTokens = new Set()) {
   return _pickBestAccount(loadAllAccountTokens(), accountState, excludeTokens);
 }
 
-// Fallback: pick any untried account even if marked limited (in case state is stale)
+// Fallback: pick any untried account even if marked limited (in case state is stale).
+// Passing the state manager keeps the usage cap enforced even on this last-resort
+// path — a cap that the fallback walks through would never hold anything back.
 function pickAnyUntried(excludeTokens) {
-  return _pickAnyUntried(loadAllAccountTokens(), excludeTokens);
+  return _pickAnyUntried(loadAllAccountTokens(), excludeTokens, accountState);
+}
+
+function isOverUsageCap(account) {
+  return _isOverUsageCap(account, accountState);
+}
+
+function usageCapState(account) {
+  return _usageCapState(account, accountState);
+}
+
+/**
+ * The accounts that a usage cap is currently holding back, with the caps that did
+ * it and when each frees up. Empty when no cap is configured or none has bitten.
+ */
+function cappedAccounts() {
+  const out = [];
+  for (const a of loadAllAccountTokens()) {
+    if (a.disabled) continue;
+    const st = usageCapState(a);
+    if (st.over) out.push({ name: a.name, label: a.label || a.name, ...st });
+  }
+  return out;
+}
+
+// ─────────────────────────────────────────────────
+// Usage-cap hold queue
+// ─────────────────────────────────────────────────
+//
+// When no account is selectable, the alternative to spending is waiting. Rather
+// than answering 429 straight away — which surfaces to the user as a broken
+// session — a request parks here until a window rolls over, an account recovers,
+// or a cap is raised from the dashboard. It still gives up eventually
+// (`usageCapHoldMin`), because a request held forever is its own kind of broken.
+
+const _capHolders = new Set(); // Set<() => void> — wake callbacks, one per parked request
+
+function wakeCapHolders(reason) {
+  if (!_capHolders.size) return;
+  log('cap', `releasing ${_capHolders.size} held request(s): ${reason}`);
+  for (const wake of [..._capHolders]) wake();
+}
+
+/** True when at least one account could serve a request right now. */
+function anyAccountSelectable() {
+  const now = Date.now();
+  return loadAllAccountTokens().some(a =>
+    !a.disabled && isAccountAvailable(a.token, a.expiresAt) && !_isOverUsageCap(a, accountState, now));
+}
+
+/**
+ * Why nothing is selectable, and when that might change — used to decide whether
+ * waiting is even worth it, and to tell the user what they are waiting for.
+ */
+function holdOutlook() {
+  const now = Date.now();
+  let capped = 0, limited = 0, earliest = Infinity;
+  for (const a of loadAllAccountTokens()) {
+    if (a.disabled) continue;
+    const cap = _usageCapState(a, accountState, now);
+    if (cap.over) {
+      capped++;
+      if (cap.freeAt) earliest = Math.min(earliest, cap.freeAt);
+      continue;
+    }
+    if (!isAccountAvailable(a.token, a.expiresAt)) {
+      limited++;
+      const st = accountState.get(a.token);
+      const at = st?.retryAfter || (st?.resetAt ? st.resetAt * 1000 : 0);
+      if (at > now) earliest = Math.min(earliest, at);
+    }
+  }
+  return { capped, limited, earliestFreeAt: earliest === Infinity ? 0 : earliest };
+}
+
+/**
+ * Park until an account frees up. Resolves to true when one did, false on timeout
+ * or client disconnect.
+ */
+async function waitForAccountRelease(deadlineMs, isGone) {
+  // Backstop poll: window rollovers fire no event to wake us. Each tick re-reads
+  // every account file, so a hold measured in hours polls lazily — on a 24h wait
+  // 5s ticks would be ~17k disk sweeps to shave at most 25s off the release. Real
+  // releases (a 429 clearing, a cap raised) still wake us instantly through
+  // `_capHolders`, so the coarse tick only delays a silent window rollover.
+  const pollFor = (remaining) => (remaining > 30 * 60_000 ? 60_000 : remaining > 5 * 60_000 ? 15_000 : 5_000);
+  while (Date.now() < deadlineMs) {
+    if (isGone()) return false;
+    // Caps live on the cached account objects, and a rollover changes the answer
+    // without changing the cache, so re-read before each check.
+    invalidateAccountsCache();
+    if (anyAccountSelectable()) return true;
+    const remaining = deadlineMs - Date.now();
+    const slice = Math.min(pollFor(remaining), remaining);
+    if (slice <= 0) break;
+    await new Promise(resolve => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        _capHolders.delete(finish);
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(finish, slice);
+      _capHolders.add(finish);
+    });
+  }
+  return !isGone() && anyAccountSelectable();
 }
 
 // ── Build forwarding headers ──
@@ -4986,6 +6765,31 @@ setInterval(async () => {
   await refreshSweep();
 }, REFRESH_CHECK_INTERVAL);
 
+// ── Unblock sweep ──
+// Re-probe accounts that are marked `limited` with no active cooldown. Those are
+// exactly the ones that can never clear themselves: the pickers skip them, so no
+// traffic reaches them, so nothing refreshes their state. Without this the fix in
+// reconcileFromProbe() would only work while a dashboard tab happened to be open
+// polling /api/profiles.
+//
+// Deliberately narrow: an account with no state at all is left alone, because a
+// probe would start its rate-limit window (the whole point of `conserve`), and one
+// inside a real cooldown is left alone because the probe cannot see a per-model cap.
+const UNBLOCK_SWEEP_INTERVAL = 2 * 60 * 1000;
+async function unblockSweep() {
+  const now = Date.now();
+  for (const acct of loadAllAccountTokens()) {
+    const st = accountState.get(acct.token);
+    if (!st || !st.limited) continue;
+    if (st.retryAfter && st.retryAfter > now) continue;
+    try {
+      const fp = getFingerprintFromToken(acct.token);
+      await getRateLimitsForToken(acct.token, fp, { allowProbe: true });
+    } catch { /* best-effort: a failed probe just means we retry in 2 min */ }
+  }
+}
+setInterval(() => { unblockSweep().catch(() => {}); }, UNBLOCK_SWEEP_INTERVAL);
+
 // ── Startup: clean orphaned .tmp files ──
 
 (function cleanupTmpFiles() {
@@ -5173,6 +6977,12 @@ async function acquireBalanceSlot(allAccounts, excludeTokens = new Set()) {
 function createUsageExtractor() {
   let inputTokens = 0;
   let outputTokens = 0;
+  // Cache tokens are most of what a Claude Code turn actually costs — a long
+  // session re-reads its whole context every turn as cache reads. Counting only
+  // input+output understated real consumption by roughly an order of magnitude,
+  // which made "how much of this account is my doing" unanswerable.
+  let cacheReadTokens = 0;
+  let cacheCreationTokens = 0;
   let model = '';
   let lineBuffer = '';
   let nextEventType = '';
@@ -5200,12 +7010,18 @@ function createUsageExtractor() {
             if (nextEventType === 'message_start' && data.message) {
               if (data.message.usage) {
                 inputTokens = data.message.usage.input_tokens || 0;
+                cacheReadTokens = data.message.usage.cache_read_input_tokens || 0;
+                cacheCreationTokens = data.message.usage.cache_creation_input_tokens || 0;
               }
               if (data.message.model) {
                 model = data.message.model;
               }
             } else if (nextEventType === 'message_delta' && data.usage) {
               outputTokens = data.usage.output_tokens || 0;
+              // message_delta restates cache counts on some responses; take the
+              // larger reading rather than letting a zero clobber message_start.
+              cacheReadTokens = Math.max(cacheReadTokens, data.usage.cache_read_input_tokens || 0);
+              cacheCreationTokens = Math.max(cacheCreationTokens, data.usage.cache_creation_input_tokens || 0);
             }
           } catch { /* not JSON or malformed — skip */ }
           nextEventType = '';
@@ -5222,6 +7038,8 @@ function createUsageExtractor() {
   extractor.getUsage = () => ({
     inputTokens,
     outputTokens,
+    cacheReadTokens,
+    cacheCreationTokens,
     model,
     ts: Date.now(),
   });
@@ -5468,7 +7286,7 @@ function updateSessionTimeline(bodyObj, acctName, usage, token) {
     // Sanitize for shell: reject paths with characters that could escape double quotes
     if (!/["$`\\]/.test(cwdStr)) {
       try {
-        branch = execSync(`git -C "${cwdStr}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 2000 }).trim();
+        branch = gitIn(cwdStr, ['rev-parse', '--abbrev-ref', 'HEAD'], { timeout: 2000 }) || branch;
       } catch {}
     }
   }
@@ -5654,29 +7472,25 @@ function ensureLocalCommitHook(cwd) {
   try {
     if (!settings.commitTokenUsage) return;
     // Check for local core.hooksPath override
-    let localHooksPath;
-    try {
-      localHooksPath = execSync(`git -C "${cwd}" config --local core.hooksPath 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
-    } catch { return; } // no local override
-    if (!localHooksPath) return;
+    // gitIn returns null instead of throwing, so these are `if` guards rather
+    // than try/catch. Without the repoRoot guard, join(null, …) would throw
+    // where the old code quietly returned.
+    const localHooksPath = gitIn(cwd, ['config', '--local', 'core.hooksPath']);
+    if (!localHooksPath) return; // no local override
 
-    // Resolve relative paths
-    let repoRoot;
-    try {
-      repoRoot = execSync(`git -C "${cwd}" rev-parse --show-toplevel 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
-    } catch { return; }
+    const repoRoot = gitIn(cwd, ['rev-parse', '--show-toplevel']);
+    if (!repoRoot) return; // not a repo
 
-    const resolvedLocal = localHooksPath.startsWith('/') ? localHooksPath : join(repoRoot, localHooksPath);
+    // `startsWith('/')` is not an absolute-path test on Windows, where they
+    // look like C:\repo\hooks — isAbsolute understands both.
+    const resolvedLocal = isAbsolute(localHooksPath) ? localHooksPath : join(repoRoot, localHooksPath);
 
     // Skip if already checked this repo
     if (_hookedRepoPaths.has(resolvedLocal)) return;
     _hookedRepoPaths.add(resolvedLocal);
 
     // Check for global hooks path
-    let globalHooksPath;
-    try {
-      globalHooksPath = execSync('git config --global core.hooksPath 2>/dev/null', { encoding: 'utf8', timeout: 3000 }).trim();
-    } catch { return; }
+    const globalHooksPath = gitSync(['config', '--global', 'core.hooksPath']);
     if (!globalHooksPath) return;
     globalHooksPath = globalHooksPath.replace(/^~/, process.env.HOME || '');
 
@@ -5701,7 +7515,9 @@ function ensureLocalCommitHook(cwd) {
     // Copy global hook to local hooks dir
     mkdirSync(resolvedLocal, { recursive: true });
     writeFileSync(localHookFile, globalHookContent);
-    try { execSync(`chmod +x "${localHookFile}"`, { timeout: 2000 }); } catch {}
+    // NTFS has no executable bit and Git for Windows runs hooks through sh
+    // regardless, so this is a no-op there rather than a failing spawn.
+    makeExecutable(localHookFile);
     log('tokens', `Installed commit hook in ${resolvedLocal} (local hooksPath override detected)`);
   } catch { /* silent — best effort */ }
 }
@@ -5710,15 +7526,20 @@ function ensureLocalCommitHook(cwd) {
 // [BETA] Token Usage Ring Buffer
 // ─────────────────────────────────────────────────
 
-const recentUsage = []; // { ts, inputTokens, outputTokens, model, account, claimed }
+const recentUsage = []; // { ts, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens, model, account, claimed }
 const RECENT_USAGE_MAX = 2000;
 
 function recordUsage(usage, account) {
-  if (!usage || (!usage.inputTokens && !usage.outputTokens)) return;
+  if (!usage) return;
+  const billable = (usage.inputTokens || 0) + (usage.outputTokens || 0)
+    + (usage.cacheReadTokens || 0) + (usage.cacheCreationTokens || 0);
+  if (!billable) return;
   recentUsage.push({
     ts: usage.ts || Date.now(),
-    inputTokens: usage.inputTokens,
-    outputTokens: usage.outputTokens,
+    inputTokens: usage.inputTokens || 0,
+    outputTokens: usage.outputTokens || 0,
+    cacheReadTokens: usage.cacheReadTokens || 0,
+    cacheCreationTokens: usage.cacheCreationTokens || 0,
     model: usage.model,
     account,
     claimed: false,
@@ -5743,34 +7564,30 @@ function claimUsageInRange(startTs, endTs) {
  * back to the real feature branch so token usage is attributed correctly.
  */
 function _resolveWorktreeBranch(cwd, detectedBranch) {
-  if (!detectedBranch.startsWith('worktree-')) return detectedBranch;
-  try {
-    // Confirm we're actually in a worktree (git-dir != git-common-dir)
-    const gitDir = execSync(`git -C "${cwd}" rev-parse --path-format=absolute --git-dir 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
-    const commonDir = execSync(`git -C "${cwd}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
-    if (gitDir === commonDir) return detectedBranch;
-  } catch { return detectedBranch; }
+  if (!detectedBranch || !detectedBranch.startsWith('worktree-')) return detectedBranch;
+  // Confirm we're actually in a worktree (git-dir != git-common-dir). If either
+  // read fails both are null, they compare equal, and the detected name stands
+  // — the safe answer when we cannot tell.
+  const gitDir = gitIn(cwd, ['rev-parse', '--path-format=absolute', '--git-dir']);
+  const commonDir = gitIn(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
+  if (gitDir === commonDir) return detectedBranch;
 
   // Strategy 1: find a non-worktree branch at the exact same commit
-  try {
-    const candidates = execSync(`git -C "${cwd}" branch --points-at HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 })
-      .trim().split('\n')
-      .map(b => b.replace(/^[*+]?\s+/, '').trim())
-      .filter(b => b && !b.startsWith('worktree-'));
-    if (candidates.length === 1) return candidates[0];
-    if (candidates.length > 1) return candidates.find(b => b.includes('/')) || candidates[0];
-  } catch { /* ignore */ }
+  const candidates = (gitIn(cwd, ['branch', '--points-at', 'HEAD']) || '')
+    .trim().split('\n')
+    .map(b => b.replace(/^[*+]?\s+/, '').trim())
+    .filter(b => b && !b.startsWith('worktree-'));
+  if (candidates.length === 1) return candidates[0];
+  if (candidates.length > 1) return candidates.find(b => b.includes('/')) || candidates[0];
 
   // Strategy 2: walk recent commits for the closest decorated non-worktree branch
-  try {
-    const lines = execSync(`git -C "${cwd}" log --format=%D --max-count=30 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim().split('\n');
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      const refs = line.split(',').map(r => r.trim())
-        .filter(r => r && !r.startsWith('HEAD') && !r.startsWith('worktree-') && !r.startsWith('origin/') && !r.startsWith('tag:'));
-      if (refs.length > 0) return refs.find(r => r.includes('/')) || refs[0];
-    }
-  } catch { /* ignore */ }
+  const lines = (gitIn(cwd, ['log', '--format=%D', '--max-count=30']) || '').split('\n');
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const refs = line.split(',').map(r => r.trim())
+      .filter(r => r && !r.startsWith('HEAD') && !r.startsWith('worktree-') && !r.startsWith('origin/') && !r.startsWith('tag:'));
+    if (refs.length > 0) return refs.find(r => r.includes('/')) || refs[0];
+  }
 
   return detectedBranch;
 }
@@ -5781,30 +7598,34 @@ function _resolveWorktreeBranch(cwd, detectedBranch) {
 
 const pendingSessions = new Map(); // session_id → { repo, branch, commitHash, cwd, startedAt }
 
+// Re-read a session's branch and commit before its usage is attributed.
+//
+// A long session can switch branch (or worktree) under us, and usage recorded
+// afterwards belongs to the new branch. Three call sites need exactly this, and
+// each used to carry its own copy of the git plumbing.
+//
+// Returns the new branch name when it changed, else null, so a caller that
+// wants to log the transition can do so without repeating the comparison.
+function refreshSessionBranch(session) {
+  if (!session?.cwd) return null;
+  const head = gitIn(session.cwd, ['rev-parse', '--abbrev-ref', 'HEAD']);
+  if (!head) return null; // not a repo any more, or git unavailable
+  const cur = _resolveWorktreeBranch(session.cwd, head);
+  if (!cur || cur === session.branch) return null;
+  const previous = session.branch;
+  session.branch = cur;
+  // Keep the old hash if this one cannot be read: a stale hash beats none.
+  session.commitHash = gitIn(session.cwd, ['rev-parse', '--short', 'HEAD']) || session.commitHash;
+  return { from: previous, to: cur };
+}
+
 // Claim and persist usage for a session (used by auto-claim and stale pruning)
 function _autoClaimSession(sessionId, session) {
   // Re-read branch before persisting (handles worktree branch switches)
-  if (session.cwd) {
-    try {
-      const cur = _resolveWorktreeBranch(session.cwd, execSync(`git -C "${session.cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim());
-      if (cur && cur !== session.branch) {
-        session.branch = cur;
-        session.commitHash = execSync(`git -C "${session.cwd}" rev-parse --short HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
-      }
-    } catch { /* ignore */ }
-  }
+  refreshSessionBranch(session);
   const claimed = claimUsageInRange(session.startedAt, Date.now());
   for (const entry of claimed) {
-    appendTokenUsage({
-      ts: entry.ts,
-      repo: session.repo,
-      branch: session.branch,
-      commitHash: session.commitHash,
-      model: entry.model,
-      inputTokens: entry.inputTokens,
-      outputTokens: entry.outputTokens,
-      account: entry.account,
-    });
+    appendTokenUsage(tokenUsageRow(entry, session));
   }
   if (claimed.length > 0) {
     log('tokens', `Auto-claimed ${claimed.length} entries for session ${sessionId.slice(0, 8)}…`);
@@ -5820,28 +7641,11 @@ setInterval(() => {
   for (const [id, session] of pendingSessions) {
     const now = Date.now();
     // Re-read branch before persisting (handles worktree branch switches)
-    if (session.cwd) {
-      try {
-        const cur = _resolveWorktreeBranch(session.cwd, execSync(`git -C "${session.cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim());
-        if (cur && cur !== session.branch) {
-          log('tokens', `Periodic: session ${id.slice(0, 8)}… branch updated: ${session.branch} → ${cur}`);
-          session.branch = cur;
-          session.commitHash = execSync(`git -C "${session.cwd}" rev-parse --short HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
-        }
-      } catch { /* ignore */ }
-    }
+    const moved = refreshSessionBranch(session);
+    if (moved) log('tokens', `Periodic: session ${id.slice(0, 8)}… branch updated: ${moved.from} → ${moved.to}`);
     const claimed = claimUsageInRange(session.startedAt, now);
     for (const entry of claimed) {
-      appendTokenUsage({
-        ts: entry.ts,
-        repo: session.repo,
-        branch: session.branch,
-        commitHash: session.commitHash,
-        model: entry.model,
-        inputTokens: entry.inputTokens,
-        outputTokens: entry.outputTokens,
-        account: entry.account,
-      });
+      appendTokenUsage(tokenUsageRow(entry, session));
     }
     if (claimed.length > 0) {
       session.startedAt = now; // advance so we don't re-claim
@@ -5874,6 +7678,85 @@ function loadTokenUsage() {
   return _tokenUsageCache;
 }
 
+// ─────────────────────────────────────────────────
+// Usage attribution — how much of an account's usage is mine
+// ─────────────────────────────────────────────────
+//
+// Two different measurements sit side by side on every account card, and the
+// difference between them is the answer to "how much of this is me":
+//
+//   utilization  — Anthropic's own number, in the response headers. It counts
+//                  EVERYONE using the account: this machine, the web app, the
+//                  phone, another laptop. It is a percentage of an opaque quota.
+//   my tokens    — counted here, from traffic that actually went through this
+//                  proxy. Exact, in tokens, and mine by construction.
+//
+// The two can't be subtracted directly (one is a share of an unknown quota, the
+// other is a token count), so the external share is inferred over TIME instead:
+// where utilization rose while this proxy saw no traffic, someone else was
+// spending. That comparison needs utilization samples, which are only kept for
+// 24h (5h window) / 7d (weekly), so slices without samples are reported as
+// unmeasured rather than silently attributed to either side.
+
+// The dashboard polls /api/profiles every 5s and the usage log holds tens of
+// thousands of rows; without this the same scan runs per account, per poll.
+const _attributionCache = new Map(); // label → { at, value }
+const ATTRIBUTION_TTL = 15_000;
+
+/** Attribution for both windows of one account. */
+function usageAttribution(acctLabel, fingerprint, now = Date.now()) {
+  const hit = _attributionCache.get(acctLabel);
+  if (hit && now - hit.at < ATTRIBUTION_TTL) return hit.value;
+
+  const all = loadTokenUsage();
+  const records = [];
+  // token-usage.json is capped at 50k rows, so it may not reach back a full 7
+  // days. Report how far it does reach rather than letting a short history read
+  // as "low usage". Tracked in the same pass — spreading 50k timestamps into
+  // Math.min() overflows the call stack.
+  let oldest = Infinity;
+  for (const r of all) {
+    if (r.account !== acctLabel) continue;
+    records.push(r);
+    if (r.ts < oldest) oldest = r.ts;
+  }
+
+  const value = {
+    fiveH: attributionForWindow(records, utilizationHistory.getHistory(fingerprint), {
+      from: now - 5 * 3600 * 1000, to: now, key: 'u5h',
+    }),
+    sevenD: attributionForWindow(records, weeklyHistory.getHistory(fingerprint), {
+      from: now - 7 * 24 * 3600 * 1000, to: now, key: 'u7d',
+    }),
+    measuredSince: oldest === Infinity ? now : oldest,
+  };
+  _attributionCache.set(acctLabel, { at: now, value });
+  return value;
+}
+
+/**
+ * The row shape written to token-usage.json, in one place: four call sites persist
+ * claimed usage, and a new field added to three of them is a silent data hole.
+ *
+ * Rows written before cache accounting existed have no cache fields; readers must
+ * treat them as 0 rather than as "no cache used", which is why the reader reports
+ * how far back complete data goes.
+ */
+function tokenUsageRow(entry, session) {
+  return {
+    ts: entry.ts,
+    repo: session.repo,
+    branch: session.branch,
+    commitHash: session.commitHash,
+    model: entry.model,
+    inputTokens: entry.inputTokens || 0,
+    outputTokens: entry.outputTokens || 0,
+    cacheReadTokens: entry.cacheReadTokens || 0,
+    cacheCreationTokens: entry.cacheCreationTokens || 0,
+    account: entry.account,
+  };
+}
+
 function appendTokenUsage(entry) {
   const usage = loadTokenUsage();
   usage.push(entry);
@@ -5894,6 +7777,89 @@ function appendTokenUsage(entry) {
 // ─────────────────────────────────────────────────
 // [BETA] Pipe helper — waits for stream to complete
 // ─────────────────────────────────────────────────
+
+// Anthropic can answer HTTP 200 and then put the failure INSIDE the stream: an
+// `error` event carrying `overloaded_error` arrives about a second in, before any
+// content. Nothing downstream retries that. The status line said success, so the
+// client's own retry budget never engages - jcode stays on `attempt 1/8`, marks the
+// turn failed and parks the session Idle until a human presses enter. Measured
+// 2026-08-18: nine of these in five minutes froze every live session for 13 minutes.
+//
+// The 529 branch below does not catch it either: that one matches on the HTTP status,
+// and this arrives as 200.
+//
+// Retrying is only safe while NOTHING has been written to the client, so this reads
+// the head of the stream before writeHead. The verdict comes from the first event
+// that carries one:
+//   error/overloaded_error, error/api_error -> transient upstream capacity, retry
+//   any other error                         -> real, hand it to the client
+//   anything else (message_start, ...)      -> a genuine answer is coming
+// `ping` carries no verdict and is skipped. Once the answer has started we hand the
+// stream over untouched: a half-written reply cannot be un-sent.
+//
+// Whatever was consumed is replayed into the returned stream, so a normal response
+// loses no bytes and no measurable time - message_start is the first thing Anthropic
+// sends, so the peek almost always ends on the very first chunk.
+const INBAND_RETRY_ERRORS = new Set(['overloaded_error', 'api_error']);
+const INBAND_PEEK_TIMEOUT_MS = 20_000;
+
+function peekStreamHead(res, { timeoutMs = INBAND_PEEK_TIMEOUT_MS } = {}) {
+  return new Promise(resolve => {
+    const chunks = [];
+    let buf = '';
+    let settled = false;
+
+    const detach = () => {
+      res.removeListener('data', onData);
+      res.removeListener('end', onEnd);
+      res.removeListener('error', onErr);
+      res.pause();
+    };
+
+    // `ended` means upstream closed while we were still peeking: there is nothing
+    // left to pipe, so the replay stream is closed after the buffered bytes.
+    const done = (retryable, errorType, ended) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      detach();
+      const stream = new PassThrough();
+      for (const c of chunks) stream.write(c);
+      if (ended) stream.end(); else res.pipe(stream);
+      resolve({ retryable, errorType, stream });
+    };
+
+    const onData = chunk => {
+      chunks.push(chunk);
+      buf += chunk.toString('utf8');
+      const events = buf.split('\n\n');
+      buf = events.pop();
+      for (const ev of events) {
+        const dataLine = ev.split('\n').find(l => l.startsWith('data:'));
+        if (!dataLine) continue;
+        let e;
+        try { e = JSON.parse(dataLine.slice(5).trim()); } catch { continue; }
+        if (e.type === 'ping') continue;
+        if (e.type === 'error') {
+          const t = e.error?.type || 'unknown';
+          done(INBAND_RETRY_ERRORS.has(t), t, false);
+          return;
+        }
+        done(false, null, false);
+        return;
+      }
+    };
+    const onEnd = () => done(false, null, true);
+    const onErr = () => done(false, null, true);
+    // A stream that says nothing at all is not evidence of an error: hand it over
+    // rather than hold the client while upstream thinks.
+    const timer = setTimeout(() => done(false, null, false), timeoutMs);
+
+    res.on('data', onData);
+    res.on('end', onEnd);
+    res.on('error', onErr);
+  });
+}
 
 function pipeAndWait(src, dst) {
   return new Promise(resolve => {
@@ -6038,14 +8004,36 @@ async function handleProxyRequest(clientReq, clientRes) {
     }
     throw e;
   }
-  const body = Buffer.concat(bodyChunks);
-  const deadline = Date.now() + REQUEST_DEADLINE_MS;
+  let body = Buffer.concat(bodyChunks);
+  // An OpenAI-compatible caller cannot carry the Claude Code identity in the
+  // shape Anthropic requires, so translate it onto the native Messages wire and
+  // remember to translate the answer back (see _openaiCompat below).
+  let _openaiCompat = null;
+  if (OPENAI_ROUTE_RE.test(clientReq.url || '') && body.length) {
+    try {
+      const parsed = JSON.parse(body.toString('utf8'));
+      const translated = openaiToMessages(parsed);
+      if (translated) {
+        body = Buffer.from(JSON.stringify(translated));
+        _openaiCompat = { stream: !!translated.stream, model: translated.model };
+        clientReq.url = (clientReq.url || '').replace(/\/(?:v1\/)?chat\/completions/, '/v1/messages');
+        clientReq.headers['anthropic-version'] = clientReq.headers['anthropic-version'] || '2023-06-01';
+      }
+    } catch { /* not JSON: forward untouched and let upstream reject it */ }
+  }
+  body = ensureClaudeCodeIdentity(clientReq.url, body);
+  // `let`, not `const`: a usage-cap hold legitimately parks the request for minutes,
+  // and the deadline is pushed out by however long we waited so the retry loop below
+  // doesn't immediately declare the request stale for time it did not spend working.
+  let deadline = Date.now() + REQUEST_DEADLINE_MS;
   const isDeadlineExceeded = () => Date.now() > deadline;
 
   // Check if keychain has a token we haven't saved yet (e.g. user just did /login)
   // Skip during error spirals to avoid creating bogus auto-accounts from stale keychain tokens
   if (_consecutive400s < 3) {
-    await autoDiscoverAccount().catch(() => {});
+    await autoDiscoverAccount().catch((e) => traceDiscovery('bail: threw', '', String(e?.message || e)));
+  } else {
+    traceDiscovery('bail: skipped during 400 spiral', '', `consecutive400s=${_consecutive400s}`);
   }
 
   let allAccounts = loadAllAccountTokens();
@@ -6095,6 +8083,63 @@ async function handleProxyRequest(clientReq, clientRes) {
   // Start with active keychain token, apply rotation strategy
   let token = getActiveToken();
   const activeAcct = allAccounts.find(a => a.token === token);
+
+  // The keychain holds a token no saved account matches — the state that makes the
+  // proactive switch log "none → …" and overwrite it. Discovery ran just above, so
+  // this should be unreachable; record both sides of the mismatch when it isn't.
+  if (!activeAcct && token) {
+    traceDiscovery(
+      'MISMATCH: active keychain token matches no saved account',
+      getFingerprintFromToken(token),
+      `saved=[${allAccounts.map(a => `${a.name}:${getFingerprintFromToken(a.token)}`).join(' ')}]`,
+    );
+  }
+
+  // ── Usage-cap / exhaustion hold ──
+  // Nothing is selectable: every account is either over a cap you set or blocked by
+  // Anthropic. Park the request instead of failing it, so the session waits out the
+  // window rather than dying. Sits before the strategy pick so that once an account
+  // frees up, the normal rotation machinery runs unchanged.
+  //
+  // A transient 429 burst does NOT land here: those don't mark an account limited,
+  // so something stays selectable and the existing pass-the-429-through path keeps
+  // handling them.
+  if (settings.usageCapHoldMin > 0 && !anyAccountSelectable()) {
+    const outlook = holdOutlook();
+    // Nothing to wait for: no cap in play and no known reset. Fall through and let
+    // the 429/exhaustion path answer — a wait with no end in sight is just a stall.
+    if (outlook.capped > 0 || outlook.earliestFreeAt > Date.now()) {
+      const holdMs = settings.usageCapHoldMin * 60 * 1000;
+      const holdUntil = Math.min(Date.now() + holdMs, outlook.earliestFreeAt || (Date.now() + holdMs));
+      const startedAt = Date.now();
+      const why = outlook.capped > 0
+        ? `${outlook.capped} account over cap${outlook.limited ? `, ${outlook.limited} rate-limited` : ''}`
+        : `${outlook.limited} account rate-limited`;
+      log('cap', `holding request — ${why}; waiting up to ${formatDuration(holdUntil - startedAt)}`);
+      logEvent('cap-hold', { capped: outlook.capped, limited: outlook.limited, until: holdUntil });
+      const released = await waitForAccountRelease(holdUntil, () => clientGone);
+      const waitedMs = Date.now() - startedAt;
+      // The wait was not work: give the request back the time it spent parked.
+      deadline += waitedMs;
+      if (clientGone) return;
+      if (released) {
+        invalidateAccountsCache();
+        allAccounts = loadAllAccountTokens();
+        log('cap', `released after ${formatDuration(waitedMs)} — resuming`);
+      } else {
+        const cappedNow = cappedAccounts();
+        const detail = cappedNow.length
+          ? `Usage cap reached on ${cappedNow.map(c => c.label).join(', ')}. This is a VDM cap, not an Anthropic limit — raise or clear it in the dashboard.`
+          : `All ${allAccounts.length} accounts rate limited. Earliest reset: ${getEarliestReset()}`;
+        log('cap', `hold expired after ${formatDuration(waitedMs)} — returning 429`);
+        logEvent('cap-exhausted', { capped: cappedNow.map(c => c.label) });
+        notify('Usage cap reached', detail);
+        clientRes.writeHead(429, { 'Content-Type': 'application/json' });
+        clientRes.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: detail } }));
+        return;
+      }
+    }
+  }
 
   if (balanceMode) {
     // Spread load across accounts by least in-flight count; no keychain write
@@ -6208,7 +8253,11 @@ async function handleProxyRequest(clientReq, clientRes) {
     }
   }
 
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+  // Transient upstream retries must not eat the account-switching budget: they
+  // are the same account being told "try again", not an account that failed.
+  let overloadRetries = 0;
+
+  for (let attempt = 0; attempt < maxAttempts + overloadRetries; attempt++) {
     // Deadline guard: on retries, bail early if we've run out of time
     if (attempt > 0 && isDeadlineExceeded()) {
       log('deadline', `Request deadline exceeded after ${attempt} attempts (${REQUEST_DEADLINE_MS}ms) — trying passthrough`);
@@ -6343,11 +8392,32 @@ async function handleProxyRequest(clientReq, clientRes) {
       // Transient burst 429s (short retry-after) are normal — Claude Code
       // retries on its own.  Pass through silently without noisy logging,
       // marking the account as limited, or sending notifications.
-      const isTransient = retryAfter < 60;
+      //
+      // But `retry-after` is usually absent: 3389 of ~3500 logged 429s carried
+      // `retry-after: 0`, which parses to 0 and looks "transient" by this rule.
+      // That is how a genuinely exhausted account kept receiving traffic — it was
+      // never marked limited, so no switch ever fired, while a 0%-used account sat
+      // idle. So cross-check the reading we already have: a 429 on an account whose
+      // measured utilization is at the ceiling is exhaustion, whatever the header
+      // says. The reading is only trusted when it is fresh, since a stale one would
+      // sideline a healthy account (5 min mirrors the rate-limit cache TTL).
+      const _st = accountState.get(token);
+      const _stateAge = _st?.updatedAt ? Date.now() - _st.updatedAt : Infinity;
+      const _util = Math.max(_st?.utilization5h || 0, _st?.utilization7d || 0);
+      const _looksExhausted = _stateAge < 5 * 60 * 1000 && _util >= 0.95;
+      const isTransient = retryAfter < 60 && !_looksExhausted;
 
       if (!isTransient) {
-        markAccountLimited(token, acctName, retryAfter);
-        logEvent('rate-limited', { account: acctName, retryAfter });
+        // No retry-after to trust: hold it until its own reset, or 5 min if even
+        // that is unknown, rather than inventing a long cooldown.
+        const _effectiveRetry = retryAfter > 0
+          ? retryAfter
+          : (_st?.resetAt > Date.now() / 1000 ? Math.round(_st.resetAt - Date.now() / 1000) : 300);
+        if (_looksExhausted && retryAfter === 0) {
+          log('switch', `${acctName} → 429 with no retry-after but utilization ${Math.round(_util * 100)}% — treating as exhausted`);
+        }
+        markAccountLimited(token, acctName, _effectiveRetry);
+        logEvent('rate-limited', { account: acctName, retryAfter: _effectiveRetry });
       }
       log('switch', `${acctName} → 429 ${isTransient ? 'transient' : 'rate limited'} (retry-after: ${retryAfter}s)`);
 
@@ -6515,7 +8585,44 @@ async function handleProxyRequest(clientReq, clientRes) {
 
       // Billing errors (credit balance too low) are never fixable by token
       // refresh — skip straight to account switching (Strategy 3).
-      const isBillingError = /credit balance|billing.*issue|payment.*required/i.test(errorMessage);
+      // Claude subscription accounts report an exhausted paid allowance as
+      // `You're out of extra usage`, not as a credit/billing error.  It has
+      // the same recovery path: this account is temporarily unusable, while
+      // another account may still serve the request.
+      const isBillingError = /credit balance|billing.*issue|payment.*required|(?:out of )?extra usage/i.test(errorMessage);
+
+      // Anthropic reuses the Extra Usage wording for the known reserved `mcp_`
+      // schema rejection. Switching accounts cannot repair a malformed native
+      // request, and used to rotate the active keychain account just because an
+      // OpenClaw/CLI tool configuration was wrong. Keep the exact upstream 400
+      // visible to the caller and leave every account state untouched.
+      if (isReservedMcpSchemaError(errorType, errorMessage, body)) {
+        log('config', `${acctName} → reserved mcp_* tool name caused ambiguous 400; passing through without failover`);
+        logEvent('reserved-mcp-schema-error', { account: acctName });
+        clientRes.writeHead(400, proxyRes.headers);
+        clientRes.end(bodyBuf);
+        return;
+      }
+
+      // OpenClaw drives Claude Code from a persistent background service. Its
+      // 400 "extra usage" responses are ambiguous (the same wording is used for
+      // configuration/schema failures), so let this one request try another
+      // account without changing the interactive VDM keychain or poisoning
+      // account availability for every other client.
+      if (isOpenClawExtraUsageError(errorType, errorMessage, body)) {
+        const next = (settings.autoSwitch || balanceMode) ? pickBestAccount(triedTokens) : null;
+        if (next) {
+          log('openclaw', `${acctName} → ambiguous Extra Usage; retrying ${next.label || next.name} without changing VDM state`);
+          token = next.token;
+          logEvent('openclaw-isolated-retry', { from: acctName, to: next.label || next.name });
+          continue;
+        }
+        log('openclaw', `${acctName} → ambiguous Extra Usage; passing through without changing VDM state`);
+        logEvent('openclaw-ambiguous-extra-usage', { account: acctName });
+        clientRes.writeHead(400, proxyRes.headers);
+        clientRes.end(bodyBuf);
+        return;
+      }
 
       // ── Content 400: pass through immediately ──
       // If the API returned a well-formed invalid_request_error and it doesn't
@@ -6537,7 +8644,7 @@ async function handleProxyRequest(clientReq, clientRes) {
       // on every subsequent request, causing an infinite cycle.
       if (isBillingError && token) {
         const BILLING_COOLDOWN_SEC = 300; // 5 min cooldown
-        accountState.markLimited(token, acctName, BILLING_COOLDOWN_SEC);
+        markAccountLimited(token, acctName, BILLING_COOLDOWN_SEC, 'extra-usage');
         billingMarkedTokens.add(token);
         log('billing', `${acctName}: marked unavailable for ${BILLING_COOLDOWN_SEC}s (billing error)`);
       }
@@ -6624,7 +8731,12 @@ async function handleProxyRequest(clientReq, clientRes) {
       if (settings.autoSwitch || balanceMode) {
         const next = balanceMode
           ? await balanceSwitch(triedTokens)
-          : (pickBestAccount(triedTokens) || pickAnyUntried(triedTokens));
+          // A billing/extra-usage response is conclusive for this account.
+          // Never use the stale-state fallback here: it can select an account
+          // already limited by a real 5h/7d quota just because it was untried.
+          : isBillingError
+            ? pickBestAccount(triedTokens)
+            : (pickBestAccount(triedTokens) || pickAnyUntried(triedTokens));
         if (next) {
           log(balanceMode ? 'balance' : 'switch', `  → 400 on ${acctName}, switching to ${next.label || next.name}`);
           if (!balanceMode) {
@@ -6642,6 +8754,17 @@ async function handleProxyRequest(clientReq, clientRes) {
           notify('Account Switched', `${acctName} → 400 error → ${next.label || next.name}`);
           continue;
         }
+      }
+
+      // No selectable subscription account remains.  The original billing
+      // response is more useful than the generic passthrough: jcode's VDM
+      // API key is a local placeholder, so passthrough would only turn this
+      // into a misleading "Invalid bearer token" 401.
+      if (isBillingError) {
+        log('billing', `${acctName}: no selectable account remains after billing error; returning upstream response`);
+        clientRes.writeHead(400, proxyRes.headers);
+        clientRes.end(bodyBuf);
+        return;
       }
 
       // ── Strategy 4 (last resort): Retry with minimal headers ──
@@ -6722,14 +8845,54 @@ async function handleProxyRequest(clientReq, clientRes) {
       return;
     }
 
-    // ── 529: Overloaded → pass through, switching won't help ──
-    if (status === 529) {
-      log('info', `${acctName} → 529 overloaded (not switching  - server-side issue)`);
-      clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
+    // ── 5xx / 529: Claude capacity failure → bounded same-account retry ──
+    // The account is healthy: rotating would burn the next account against the
+    // same upstream wall. No bytes have reached JCode yet, so retrying here is
+    // still safe. If it persists, retain Anthropic's original response and add
+    // a short retry hint when the upstream omitted one.
+    if (isRetryableUpstreamStatus(status)) {
+      const upstreamRetry = getUpstreamRetryPlan(status, overloadRetries);
+      if (upstreamRetry && !isDeadlineExceeded()) {
+        const { attempt: retryAttempt, delayMs: wait } = upstreamRetry;
+        overloadRetries = retryAttempt;
+        log('retry', `${acctName} → upstream ${status}, retrying same account in ${wait}ms (${retryAttempt}/${UPSTREAM_RETRY_BACKOFF_MS.length})`);
+        logEvent('upstream-retry', { account: acctName, status, attempt: retryAttempt });
+        await drainResponse(proxyRes);
+        await new Promise(r => setTimeout(r, wait));
+        continue;
+      }
+      log('error', `${acctName} → upstream ${status}, ${overloadRetries} retries exhausted — passing it to the client`);
+      const retryHeaders = { ...proxyRes.headers };
+      if (!retryHeaders['retry-after']) retryHeaders['retry-after'] = '5';
+      clientRes.writeHead(proxyRes.statusCode, retryHeaders);
       proxyRes.on('error', () => { try { clientRes.end(); } catch {} });
       clientRes.on('close', () => { proxyRes.destroy(); });
       await pipeAndWait(proxyRes, clientRes);
       return;
+    }
+
+    // ── 200 whose failure is inside the stream → retry while nothing is written ──
+    let resBody = proxyRes;
+    if (status >= 200 && status < 300 &&
+        (proxyRes.headers['content-type'] || '').includes('text/event-stream')) {
+      const peek = await peekStreamHead(proxyRes);
+      resBody = peek.stream;
+      if (peek.retryable) {
+        const budget = UPSTREAM_RETRY_BACKOFF_MS.length;
+        if (overloadRetries < budget && !isDeadlineExceeded()) {
+          const wait = UPSTREAM_RETRY_BACKOFF_MS[overloadRetries];
+          overloadRetries++;
+          log('retry', `${acctName} → ${peek.errorType} inside a 200 stream — retrying in ${wait}ms (${overloadRetries}/${budget})`);
+          logEvent('inband-retry', { account: acctName, type: peek.errorType, attempt: overloadRetries });
+          resBody.destroy();
+          proxyRes.destroy();
+          await new Promise(r => setTimeout(r, wait));
+          // Same account on purpose: upstream capacity is not this account's fault,
+          // and switching would spend a healthy account on the same wall.
+          continue;
+        }
+        log('error', `${acctName} → ${peek.errorType} inside a 200 stream, ${overloadRetries} retries exhausted — passing it to the client`);
+      }
     }
 
     // ── Any other response: success or client error → pipe through ──
@@ -6748,6 +8911,46 @@ async function handleProxyRequest(clientReq, clientRes) {
       }
     }
 
+    // ── Translate back for a caller that spoke OpenAI ──
+    // Done before writeHead: the upstream headers describe a Messages response
+    // (and carry a content-length that no longer matches after translation).
+    if (_openaiCompat && proxyRes.statusCode >= 200 && proxyRes.statusCode < 300) {
+      const outHeaders = { ...proxyRes.headers };
+      delete outHeaders['content-length'];
+      delete outHeaders['content-encoding'];
+
+      if (_openaiCompat.stream) {
+        clientRes.writeHead(proxyRes.statusCode, outHeaders);
+        proxyRes.on('error', () => { try { clientRes.end(); } catch {} });
+        clientRes.on('close', () => { proxyRes.destroy(); });
+        // Usage is still extracted from the ANTHROPIC stream, upstream of the
+        // translation, so attribution keeps working on this route too.
+        const extractor = createUsageExtractor();
+        resBody.pipe(extractor).pipe(createOpenaiSseTranslator(_openaiCompat.model)).pipe(clientRes);
+        await new Promise(resolve => {
+          let done = false;
+          const finish = () => { if (!done) { done = true; resolve(); } };
+          clientRes.on('close', finish);
+          clientRes.on('finish', finish);
+          proxyRes.on('error', finish);
+        });
+        recordUsage(extractor.getUsage(), acctName);
+        return;
+      }
+
+      const raw = await drainResponse(proxyRes);
+      let payload;
+      try {
+        payload = Buffer.from(JSON.stringify(messagesToOpenai(JSON.parse(raw.toString('utf8')))));
+      } catch {
+        payload = raw; // unparseable: hand back what upstream said rather than inventing
+      }
+      outHeaders['content-type'] = 'application/json';
+      clientRes.writeHead(proxyRes.statusCode, outHeaders);
+      clientRes.end(payload);
+      return;
+    }
+
     clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
     proxyRes.on('error', () => { try { clientRes.end(); } catch {} });
     clientRes.on('close', () => { proxyRes.destroy(); });
@@ -6756,7 +8959,7 @@ async function handleProxyRequest(clientReq, clientRes) {
     const contentType = proxyRes.headers['content-type'] || '';
     if (contentType.includes('text/event-stream')) {
       const extractor = createUsageExtractor();
-      proxyRes.pipe(extractor).pipe(clientRes);
+      resBody.pipe(extractor).pipe(clientRes);
       await new Promise(resolve => {
         let done = false;
         const finish = () => { if (!done) { done = true; resolve(); } };
@@ -6871,7 +9074,7 @@ process.on('unhandledRejection', (reason) => {
   try { log('fatal', `Unhandled rejection: ${reason}`); } catch { /* swallow */ }
 });
 
-proxyServer.listen(PROXY_PORT, () => {
+proxyServer.listen(PROXY_PORT, HOST, () => {
   const s = settings;
-  log('info', `API proxy on http://localhost:${PROXY_PORT} (proxy=${s.proxyEnabled ? 'on' : 'off'}, auto-switch=${s.autoSwitch ? 'on' : 'off'}, rotation=${s.rotationStrategy || 'conserve'}, ${loadAllAccountTokens().length} accounts)`);
+  log('info', `API proxy on http://${HOST}:${PROXY_PORT} (proxy=${s.proxyEnabled ? 'on' : 'off'}, auto-switch=${s.autoSwitch ? 'on' : 'off'}, rotation=${s.rotationStrategy || 'conserve'}, ${loadAllAccountTokens().length} accounts)`);
 });

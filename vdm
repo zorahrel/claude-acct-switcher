@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # vdm - Van Damme-o-Matic
-# Manages multiple Claude Code OAuth credential profiles via macOS Keychain.
-# All running Claude Code sessions share the same Keychain entry,
-# so switching here affects every open tab.
+# Manages multiple Claude Code OAuth credential profiles: the macOS Keychain on
+# a Mac, ~/.claude/.credentials.json on Windows. All running Claude Code
+# sessions share that one active entry, so switching here affects every tab.
 
 set -euo pipefail
 
@@ -47,106 +47,80 @@ if [[ -f "$SCRIPT_DIR/install-hooks.sh" ]]; then
 fi
 
 # ─────────────────────────────────────────────────────────
-# Keychain service auto-detection
+# Node helper
+# ─────────────────────────────────────────────────────────
+#
+# JSON parsing, token hashing and credential-store access all go through
+# vdm-helper.mjs. It used to be inline `python3 -c` with the shell's variables
+# interpolated into the Python source — which meant python3 was a hard
+# dependency (absent on a stock Windows box, where `python3` is a Store stub
+# that exits non-zero), and a path containing a quote was injected into the
+# program text rather than passed as data.
+NODE_BIN="${VDM_NODE:-node}"
+HELPER="$SCRIPT_DIR/vdm-helper.mjs"
+
+if ! command -v "$NODE_BIN" >/dev/null 2>&1; then
+  echo "vdm needs Node.js 18+ on PATH (set VDM_NODE to point at it)." >&2
+  exit 1
+fi
+
+# helper <subcommand> [args...] — never prints a token unless asked to.
+helper() {
+  "$NODE_BIN" "$HELPER" "$@"
+}
+
+# ─────────────────────────────────────────────────────────
+# Keychain service auto-detection (macOS only)
 # ─────────────────────────────────────────────────────────
 
+# The credential store is the macOS Keychain or, on Windows,
+# ~/.claude/.credentials.json. vdm-helper.mjs picks; the shell never needs to
+# know which. KEYCHAIN_SERVICE survives only for the status line.
 detect_keychain_service() {
-  # Try the known default first
-  if security find-generic-password -a "$KEYCHAIN_ACCOUNT" -s "Claude Code-credentials" -w &>/dev/null; then
-    echo "Claude Code-credentials"
-    return
+  if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+    if security find-generic-password -a "$KEYCHAIN_ACCOUNT" -s "Claude Code-credentials" -w &>/dev/null; then
+      echo "Claude Code-credentials"
+      return
+    fi
+    local svc
+    svc=$(security dump-keychain 2>/dev/null | grep -A4 '"svce"' | grep -i claude | head -1 | sed -n 's/.*"svce"<blob>="\([^"]*\)".*/\1/p') || true
+    if [[ -n "$svc" ]]; then echo "$svc"; return; fi
   fi
-  # Broader search for any Claude credential
-  local svc
-  svc=$(security dump-keychain 2>/dev/null | grep -A4 '"svce"' | grep -i claude | head -1 | sed -n 's/.*"svce"<blob>="\([^"]*\)".*/\1/p') || true
-  if [[ -n "$svc" ]]; then
-    echo "$svc"
-    return
-  fi
-  # Fallback
   echo "Claude Code-credentials"
 }
 
 KEYCHAIN_SERVICE="$(detect_keychain_service)"
 
-# ─────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────
-
 read_keychain() {
-  security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null
+  helper read-creds 2>/dev/null
 }
 
-write_keychain() {
-  local creds="$1"
-  # Delete existing entry first (security won't overwrite)
-  security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" 2>/dev/null || true
-  # Write new entry
-  security add-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w "$creds"
+# Takes the profile PATH, not its contents: the credential blob then never
+# passes through a shell variable, a process listing, or the shell history.
+write_keychain_from_file() {
+  helper write-creds "$1"
 }
 
 get_active_fingerprint() {
-  local creds
-  creds=$(read_keychain 2>/dev/null) || return 1
-  echo "$creds" | python3 -c "
-import sys, json, hashlib
-d = json.load(sys.stdin)
-token = d.get('claudeAiOauth', {}).get('accessToken', '')
-print(hashlib.sha256(token.encode()).hexdigest()[:16])
-" 2>/dev/null
+  helper active-fingerprint 2>/dev/null
 }
 
 get_profile_fingerprint() {
-  local file="$1"
-  python3 -c "
-import sys, json, hashlib
-with open('$file') as f:
-    d = json.load(f)
-token = d.get('claudeAiOauth', {}).get('accessToken', '')
-print(hashlib.sha256(token.encode()).hexdigest()[:16])
-" 2>/dev/null
+  helper profile-fingerprint "$1" 2>/dev/null
 }
 
 get_profile_info() {
-  local file="$1"
-  python3 -c "
-import sys, json, datetime
-with open('$file') as f:
-    d = json.load(f)
-oauth = d.get('claudeAiOauth', {})
-sub = oauth.get('subscriptionType', 'unknown')
-tier = oauth.get('rateLimitTier', 'unknown')
-expires = oauth.get('expiresAt', 0)
-exp_str = datetime.datetime.fromtimestamp(expires/1000).strftime('%Y-%m-%d %H:%M') if expires else 'unknown'
-# Clean up tier display
-tier_short = tier.split('_')[-1] if '_' in tier else tier
-print(f'{sub}|{tier_short}|{exp_str}')
-" 2>/dev/null
+  helper profile-info "$1" 2>/dev/null
 }
 
 fetch_account_email() {
   local token="$1"
-  local org_name
-  org_name=$(curl -s \
+  curl -s \
     -H "Authorization: Bearer $token" \
     -H "anthropic-beta: oauth-2025-04-20" \
     -H "User-Agent: claude-code/vdm" \
     "https://api.anthropic.com/api/oauth/claude_cli/roles" 2>/dev/null \
-    | python3 -c "
-import sys, json, re
-try:
-    d = json.load(sys.stdin)
-    name = d.get('organization_name', '')
-    # Extract email from 'user@email.com'\''s Organization'
-    match = re.match(r\"(.+?)(?:'s Organization| Organization)$\", name)
-    if match:
-        print(match.group(1))
-    else:
-        print(name)
-except:
-    pass
-" 2>/dev/null)
-  echo "$org_name"
+    | helper parse-org-email 2>/dev/null
 }
 
 format_sub_type() {
@@ -165,33 +139,7 @@ format_sub_type() {
 log_activity() {
   local type="$1"
   shift
-  # Build JSON entry: { "ts": <epoch_ms>, "type": "<type>", ...extra }
-  python3 -c "
-import json, time, sys, os
-
-log_file = '$ACTIVITY_LOG_FILE'
-entry = {'ts': int(time.time() * 1000), 'type': '$type'}
-
-# Parse extra key=value args
-for arg in sys.argv[1:]:
-    if '=' in arg:
-        k, v = arg.split('=', 1)
-        entry[k] = v
-
-# Load existing log
-log = []
-try:
-    with open(log_file) as f:
-        log = json.load(f)
-except:
-    pass
-
-log.insert(0, entry)
-log = log[:200]  # max 200 entries
-
-with open(log_file, 'w') as f:
-    json.dump(log, f, indent=2)
-" "$@" 2>/dev/null || true
+  helper log-activity "$ACTIVITY_LOG_FILE" "$type" "$@" 2>/dev/null || true
 }
 
 # ─────────────────────────────────────────────────────────
@@ -211,70 +159,40 @@ write_config() {
 }
 
 get_config_value() {
-  local key="$1"
-  read_config | python3 -c "import sys,json; print(json.load(sys.stdin).get('$key', ''))" 2>/dev/null
+  helper config-get "$CONFIG_FILE" "$1" 2>/dev/null
 }
 
+# `value` here is a JSON literal (true/false/a number), matching the original
+# contract where it was pasted straight into Python source.
 set_config_value() {
-  local key="$1"
-  local value="$2"
-  python3 -c "
-import json
-try:
-    with open('$CONFIG_FILE') as f:
-        cfg = json.load(f)
-except:
-    cfg = {'autoSwitch': True, 'proxyEnabled': True}
-cfg['$key'] = $value
-with open('$CONFIG_FILE', 'w') as f:
-    json.dump(cfg, f, indent=2)
-" 2>/dev/null
+  local key="$1" value="$2" type=string
+  case "$value" in
+    true|false) type=bool ;;
+    null) type=null ;;
+    ''|*[!0-9.-]*) type=string ;;
+    *) type=number ;;
+  esac
+  helper config-set "$CONFIG_FILE" "$key" "$value" "$type" 2>/dev/null
 }
 
 get_config_string() {
-  local key="$1"
-  read_config | python3 -c "import sys,json; print(json.load(sys.stdin).get('$key', ''))" 2>/dev/null
+  helper config-get "$CONFIG_FILE" "$1" 2>/dev/null
 }
 
 set_config_string() {
-  local key="$1"
-  local value="$2"
-  python3 -c "
-import json
-try:
-    with open('$CONFIG_FILE') as f:
-        cfg = json.load(f)
-except:
-    cfg = {}
-cfg['$key'] = '$value'
-with open('$CONFIG_FILE', 'w') as f:
-    json.dump(cfg, f, indent=2)
-" 2>/dev/null
+  helper config-set "$CONFIG_FILE" "$1" "$2" string 2>/dev/null
 }
 
 set_config_number() {
-  local key="$1"
-  local value="$2"
-  python3 -c "
-import json
-try:
-    with open('$CONFIG_FILE') as f:
-        cfg = json.load(f)
-except:
-    cfg = {}
-cfg['$key'] = $value
-with open('$CONFIG_FILE', 'w') as f:
-    json.dump(cfg, f, indent=2)
-" 2>/dev/null
+  helper config-set "$CONFIG_FILE" "$1" "$2" number 2>/dev/null
 }
 
 # Best-effort: push the just-written key to a running dashboard so the change
 # applies live (the dashboard otherwise only reads config.json at startup).
 # Reads the value back from config.json so JSON typing (bool/number/string) is correct.
 apply_setting_live() {
-  local key="$1"
-  local body
-  body=$(read_config | python3 -c "import sys,json; c=json.load(sys.stdin); print(json.dumps({'$key': c.get('$key')}))" 2>/dev/null) || return 0
+  local key="$1" body
+  body=$(helper config-one "$CONFIG_FILE" "$key" 2>/dev/null) || return 0
   [[ -z "$body" ]] && return 0
   curl -s --max-time 2 -X POST "http://localhost:$DASHBOARD_PORT/api/settings" \
     -H 'Content-Type: application/json' -d "$body" >/dev/null 2>&1 || true
@@ -299,7 +217,7 @@ cmd_add() {
 
   local creds
   creds=$(read_keychain) || {
-    echo -e "${RED}No credentials found in Keychain. Run 'claude login' first.${NC}"
+    echo -e "${RED}No active Claude Code credentials found. Run 'claude login' first.${NC}"
     return 1
   }
 
@@ -315,7 +233,7 @@ cmd_add() {
 
   # Auto-fetch email from API
   local token
-  token=$(echo "$creds" | python3 -c "import sys,json; print(json.load(sys.stdin)['claudeAiOauth']['accessToken'])" 2>/dev/null)
+  token=$(helper active-token 2>/dev/null)
   local email=""
   if [[ -n "$token" ]]; then
     email=$(fetch_account_email "$token")
@@ -357,6 +275,82 @@ cmd_label() {
   log_activity "account-renamed" "name=$name" "label=$label"
 }
 
+cmd_priority() {
+  local name="${1:-}"
+  local priority="${2:-}"
+  if [[ -z "$name" || -z "$priority" ]]; then
+    echo -e "${RED}Usage: vdm priority <name> <n>${NC}"
+    echo "  Sets an account's priority for the 'priority' rotation strategy."
+    echo "  Higher number = preferred first; 0 (default) clears it."
+    echo "  Example: vdm priority work-account 10"
+    return 1
+  fi
+
+  name=$(echo "$name" | tr ' ' '-' | tr '[:upper:]' '[:lower:]')
+  if [[ ! "$priority" =~ ^-?[0-9]+$ ]]; then
+    echo -e "${RED}Priority must be an integer (e.g. 10, 0, -1).${NC}"
+    return 1
+  fi
+  local file="$ACCOUNTS_DIR/${name}.json"
+  if [[ ! -f "$file" ]]; then
+    echo -e "${RED}Profile '$name' not found.${NC}"
+    return 1
+  fi
+
+  # Prefer the dashboard API (writes the sidecar AND invalidates the account
+  # cache so the change takes effect immediately); fall back to a direct write.
+  local resp=""
+  if curl -s --max-time 2 "http://localhost:$DASHBOARD_PORT/health" >/dev/null 2>&1; then
+    resp=$(curl -s --max-time 2 -X POST "http://localhost:$DASHBOARD_PORT/api/priority" \
+      -H "Content-Type: application/json" \
+      -d "{\"name\":\"$name\",\"priority\":$priority}" 2>/dev/null) || true
+  fi
+  if [[ -z "$resp" ]]; then
+    # Dashboard not running — write the sidecar directly.
+    if [[ "$priority" == "0" ]]; then
+      rm -f "$ACCOUNTS_DIR/${name}.priority"
+    else
+      echo "$priority" > "$ACCOUNTS_DIR/${name}.priority"
+    fi
+  fi
+
+  echo -e "${GREEN}✓${NC} Set priority of ${BOLD}$name${NC} to ${CYAN}$priority${NC}"
+}
+
+# Enable/disable an account for rotation WITHOUT removing it (sidecar `.disabled`).
+cmd_set_enabled() {
+  local name="${1:-}" enabled="$2" verb="$3"
+  if [[ -z "$name" ]]; then
+    echo -e "${RED}Usage: vdm $verb <name>${NC}"
+    echo "  Excludes/includes an account from rotation without removing it."
+    return 1
+  fi
+  name=$(echo "$name" | tr ' ' '-' | tr '[:upper:]' '[:lower:]')
+  if [[ ! -f "$ACCOUNTS_DIR/${name}.json" ]]; then
+    echo -e "${RED}Profile '$name' not found.${NC}"
+    return 1
+  fi
+  # Prefer the dashboard API (invalidates the account cache so the change takes
+  # effect immediately); fall back to a direct sidecar write.
+  local resp=""
+  if curl -s --max-time 2 "http://localhost:$DASHBOARD_PORT/health" >/dev/null 2>&1; then
+    resp=$(curl -s --max-time 2 -X POST "http://localhost:$DASHBOARD_PORT/api/account-enabled" \
+      -H "Content-Type: application/json" \
+      -d "{\"name\":\"$name\",\"enabled\":$enabled}" 2>/dev/null) || true
+  fi
+  if [[ -z "$resp" ]]; then
+    if [[ "$enabled" == "false" ]]; then : > "$ACCOUNTS_DIR/${name}.disabled"; else rm -f "$ACCOUNTS_DIR/${name}.disabled"; fi
+  fi
+  if [[ "$enabled" == "false" ]]; then
+    echo -e "${YELLOW}✓${NC} Disabled ${BOLD}$name${NC} ${DIM}(excluded from rotation, not removed)${NC}"
+  else
+    echo -e "${GREEN}✓${NC} Enabled ${BOLD}$name${NC}"
+  fi
+}
+
+cmd_disable() { cmd_set_enabled "${1:-}" false disable; }
+cmd_enable()  { cmd_set_enabled "${1:-}" true  enable; }
+
 cmd_list() {
   local active_fp
   active_fp=$(get_active_fingerprint 2>/dev/null) || active_fp=""
@@ -381,6 +375,9 @@ cmd_list() {
     local label_file="$ACCOUNTS_DIR/${name}.label"
     local label=""
     [[ -f "$label_file" ]] && label=$(cat "$label_file")
+    local priority_file="$ACCOUNTS_DIR/${name}.priority"
+    local priority=""
+    [[ -f "$priority_file" ]] && priority=$(cat "$priority_file")
 
     if [[ "$fp" == "$active_fp" ]]; then
       echo -e "  ${GREEN}▸ ${BOLD}$name${NC}  $(format_sub_type "$sub_type")  ${GREEN}← active${NC}"
@@ -391,6 +388,9 @@ cmd_list() {
       echo -e "      ${DIM}$label${NC}"
     fi
     echo -e "      ${DIM}tier: $tier  expires: $expires${NC}"
+    if [[ -n "$priority" && "$priority" != "0" ]]; then
+      echo -e "      ${DIM}priority: $priority${NC}"
+    fi
   done
 
   echo ""
@@ -467,9 +467,12 @@ cmd_switch() {
     return 0
   fi
 
-  local creds
-  creds=$(cat "$file")
-  write_keychain "$creds"
+  # The path, not the contents: the credential blob never enters a shell
+  # variable, a process listing, or the shell history.
+  if ! write_keychain_from_file "$file"; then
+    echo -e "${RED}Could not write the credentials. Nothing was changed.${NC}" >&2
+    return 1
+  fi
 
   local info=$(get_profile_info "$file" 2>/dev/null)
   local sub_type=$(echo "$info" | cut -d'|' -f1)
@@ -505,7 +508,7 @@ cmd_remove() {
 cmd_status() {
   local creds
   creds=$(read_keychain 2>/dev/null) || {
-    echo -e "${RED}No credentials found in Keychain.${NC}"
+    echo -e "${RED}No active Claude Code credentials found. Run 'claude login' first.${NC}"
     return 1
   }
 
@@ -523,17 +526,7 @@ cmd_status() {
   done
 
   local info
-  info=$(echo "$creds" | python3 -c "
-import sys, json, datetime
-d = json.load(sys.stdin)
-oauth = d.get('claudeAiOauth', {})
-sub = oauth.get('subscriptionType', 'unknown')
-tier = oauth.get('rateLimitTier', 'unknown')
-expires = oauth.get('expiresAt', 0)
-exp_str = datetime.datetime.fromtimestamp(expires/1000).strftime('%Y-%m-%d %H:%M') if expires else 'unknown'
-scopes = ', '.join(oauth.get('scopes', []))
-print(f'{sub}|{tier}|{exp_str}|{scopes}')
-")
+  info=$(helper active-info 2>/dev/null)
 
   local sub_type=$(echo "$info" | cut -d'|' -f1)
   local tier=$(echo "$info" | cut -d'|' -f2)
@@ -542,7 +535,7 @@ print(f'{sub}|{tier}|{exp_str}|{scopes}')
 
   # Fetch email
   local token
-  token=$(echo "$creds" | python3 -c "import sys,json; print(json.load(sys.stdin)['claudeAiOauth']['accessToken'])" 2>/dev/null)
+  token=$(helper active-token 2>/dev/null)
   local email=""
   if [[ -n "$token" ]]; then
     email=$(fetch_account_email "$token")
@@ -598,19 +591,7 @@ print(f'{sub}|{tier}|{exp_str}|{scopes}')
     local pstatus
     pstatus=$(curl -s --max-time 2 "http://localhost:$DASHBOARD_PORT/api/proxy-status" 2>/dev/null) || true
     if [[ -n "$pstatus" ]]; then
-      echo "$pstatus" | python3 -c "
-import sys, json
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-b = d.get('balance', {})
-total = b.get('totalInflight', 0); waiting = b.get('waiting', 0)
-print(f'  In-flight:     {total} total' + (f', {waiting} waiting for a slot' if waiting else ''))
-rows = [(a.get('label') or a.get('name'), a.get('inflight', 0)) for a in d.get('accounts', []) if a.get('inflight')]
-for name, n in sorted(rows, key=lambda r: -r[1]):
-    print(f'                 {name}: {n}')
-" 2>/dev/null || true
+      echo "$pstatus" | helper format-balance 2>/dev/null || true
     fi
   fi
 
@@ -718,16 +699,20 @@ cmd_config() {
 
   if [[ "$is_bool" == "true" ]]; then
     # Boolean setting
+    # JSON booleans, lowercase. These used to be the Python literals True/False
+    # because the value was pasted into Python source; written to config.json as
+    # such they became the STRINGS "True"/"False", which are both truthy in JS —
+    # so `vdm config proxy off` read back as on.
     case "$value" in
-      on|true|1|yes)   value="True" ;;
-      off|false|0|no)  value="False" ;;
+      on|true|1|yes)   value="true" ;;
+      off|false|0|no)  value="false" ;;
       *)
         echo -e "${RED}Invalid value: $value${NC}  (use on/off)"
         return 1
         ;;
     esac
     set_config_value "$key" "$value"
-    if [[ "$value" == "True" ]]; then
+    if [[ "$value" == "true" ]]; then
       echo -e "${GREEN}✓${NC} ${BOLD}$key${NC} = ${GREEN}on${NC}"
     else
       echo -e "${GREEN}✓${NC} ${BOLD}$key${NC} = ${DIM}off${NC}"
@@ -799,7 +784,7 @@ cmd_dashboard() {
       if [[ "$stopped" != "true" ]]; then
         # Find by port
         local pid
-        pid=$(lsof -iTCP:"$DASHBOARD_PORT" -sTCP:LISTEN -t 2>/dev/null | head -1) || true
+        pid=$(helper port-pid "$DASHBOARD_PORT" 2>/dev/null) || true
         if [[ -n "$pid" ]]; then
           kill "$pid" 2>/dev/null
           stopped=true
@@ -823,7 +808,7 @@ cmd_dashboard() {
         rm -f "$DASHBOARD_PID_FILE"
       fi
       # Also check by port
-      if lsof -iTCP:"$DASHBOARD_PORT" -sTCP:LISTEN -t >/dev/null 2>&1; then
+      if helper port-busy "$DASHBOARD_PORT" 2>/dev/null; then
         echo -e "${YELLOW}Dashboard already running at http://localhost:$DASHBOARD_PORT${NC}"
         echo -e "${DIM}Use 'vdm dashboard stop' to stop it.${NC}"
         return 0
@@ -854,7 +839,10 @@ cmd_dashboard() {
 }
 
 cmd_upgrade() {
-  local REPO_URL="https://github.com/loekj/claude-acct-switcher.git"
+  # This fork, not upstream. Pointing upgrade at loekj/claude-acct-switcher
+  # would replace every patched file with the unpatched original — which is
+  # exactly the failure this fork exists to stop repeating.
+  local REPO_URL="${VDM_REPO_URL:-https://github.com/zorahrel/claude-acct-switcher.git}"
   local tmpdir
   tmpdir=$(mktemp -d)
   # Ensure cleanup on any exit from this function
@@ -888,7 +876,7 @@ cmd_upgrade() {
   fi
 
   # Verify the fetched repo has the files we need
-  for f in vdm dashboard.mjs lib.mjs install-hooks.sh; do
+  for f in vdm dashboard.mjs lib.mjs platform.mjs vdm-helper.mjs install-hooks.sh; do
     if [[ ! -f "$tmpdir/$f" ]]; then
       echo -e "  ${RED}Fetched repo is missing $f — aborting.${NC}"
       return 1
@@ -899,7 +887,7 @@ cmd_upgrade() {
   local dashboard_was_running=false
   if [[ -f "$DASHBOARD_PID_FILE" ]] && kill -0 "$(cat "$DASHBOARD_PID_FILE")" 2>/dev/null; then
     dashboard_was_running=true
-  elif lsof -iTCP:"$DASHBOARD_PORT" -sTCP:LISTEN -t >/dev/null 2>&1; then
+  elif helper port-busy "$DASHBOARD_PORT" 2>/dev/null; then
     dashboard_was_running=true
   fi
 
@@ -909,7 +897,7 @@ cmd_upgrade() {
     cmd_dashboard stop
     # Also kill any process on the port not tracked by PID file (e.g. shell auto-start)
     local port_pid
-    port_pid=$(lsof -iTCP:"$DASHBOARD_PORT" -sTCP:LISTEN -t 2>/dev/null | head -1) || true
+    port_pid=$(helper port-pid "$DASHBOARD_PORT" 2>/dev/null) || true
     if [[ -n "$port_pid" ]]; then
       kill "$port_pid" 2>/dev/null || true
     fi
@@ -921,8 +909,12 @@ cmd_upgrade() {
   cp "$tmpdir/vdm"               "$SCRIPT_DIR/vdm"
   cp "$tmpdir/dashboard.mjs"     "$SCRIPT_DIR/dashboard.mjs"
   cp "$tmpdir/lib.mjs"           "$SCRIPT_DIR/lib.mjs"
+  cp "$tmpdir/platform.mjs"      "$SCRIPT_DIR/platform.mjs"
+  cp "$tmpdir/vdm-helper.mjs"    "$SCRIPT_DIR/vdm-helper.mjs"
   cp "$tmpdir/install-hooks.sh"  "$SCRIPT_DIR/install-hooks.sh"
-  chmod +x "$SCRIPT_DIR/vdm"
+  # A missing platform.mjs would leave dashboard.mjs unable to start at all, so
+  # the copy list and this check must stay in step with the import graph.
+  chmod +x "$SCRIPT_DIR/vdm" 2>/dev/null || true
 
   # Write version marker
   echo "$latest_hash" > "$SCRIPT_DIR/.version"
@@ -978,10 +970,10 @@ cmd_tokens() {
   # Build URL
   local url="http://localhost:$DASHBOARD_PORT/api/token-usage?since=$since"
   if [[ -n "$repo" ]]; then
-    url="${url}&repo=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$repo'))" 2>/dev/null)"
+    url="${url}&repo=$(helper urlencode "$repo" 2>/dev/null)"
   fi
   if [[ -n "$branch" ]]; then
-    url="${url}&branch=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$branch'))" 2>/dev/null)"
+    url="${url}&branch=$(helper urlencode "$branch" 2>/dev/null)"
   fi
 
   local usage
@@ -1000,66 +992,7 @@ cmd_tokens() {
     fi
     echo ""
 
-    python3 -c "
-import json, sys, subprocess, os
-
-usage = json.loads('''$usage''')
-repo = '$repo'
-
-if not repo:
-    print('  No repo specified or detected.')
-    sys.exit(0)
-
-# Get git log
-try:
-    log = subprocess.check_output(
-        ['git', '-C', repo, 'log', '--format=%H %ct %s', '--reverse'],
-        stderr=subprocess.DEVNULL
-    ).decode().strip().split('\n')
-except:
-    print('  Could not read git log.')
-    sys.exit(0)
-
-commits = []
-for line in log:
-    if not line.strip(): continue
-    parts = line.split(' ', 2)
-    if len(parts) >= 3:
-        commits.append({'hash': parts[0][:7], 'ts': int(parts[1]) * 1000, 'msg': parts[2]})
-
-if not commits:
-    print('  No commits found.')
-    sys.exit(0)
-
-# Build buckets: between consecutive commits
-buckets = []
-for i, c in enumerate(commits):
-    start_ts = c['ts']
-    end_ts = commits[i+1]['ts'] if i+1 < len(commits) else float('inf')
-    tokens = sum(e['inputTokens'] + e['outputTokens'] for e in usage if start_ts <= e['ts'] < end_ts)
-    if tokens > 0:
-        buckets.append({'hash': c['hash'], 'tokens': tokens, 'msg': c['msg'][:60]})
-
-# Uncommitted bucket (after last commit)
-if commits:
-    uncommitted = sum(e['inputTokens'] + e['outputTokens'] for e in usage if e['ts'] >= commits[-1]['ts'])
-
-if not buckets and uncommitted <= 0:
-    print('  No token usage found in this period.')
-    sys.exit(0)
-
-for b in buckets:
-    tok = f'{b[\"tokens\"]:>10,}'
-    print(f'  {b[\"hash\"]}  {tok} tok  {b[\"msg\"]}')
-
-if uncommitted > 0:
-    tok = f'{uncommitted:>10,}'
-    print(f'  (uncommitted)  {tok} tok')
-
-total = sum(b['tokens'] for b in buckets) + (uncommitted if uncommitted > 0 else 0)
-print(f'')
-print(f'  Total: {total:,} tokens')
-" 2>/dev/null
+    printf '%s' "$usage" | helper usage-per-commit "$repo" 2>/dev/null
     echo ""
     return 0
   fi
@@ -1077,39 +1010,7 @@ print(f'  Total: {total:,} tokens')
   echo -e "  ${DIM}Period: last $days day(s)${NC}"
   echo ""
 
-  python3 -c "
-import json, sys
-
-usage = json.loads('''$usage''')
-if not usage:
-    print('  No token usage recorded in this period.')
-    sys.exit(0)
-
-# Group by model
-models = {}
-total_in = 0
-total_out = 0
-for e in usage:
-    m = e.get('model', 'unknown')
-    if m not in models:
-        models[m] = {'input': 0, 'output': 0}
-    models[m]['input'] += e.get('inputTokens', 0)
-    models[m]['output'] += e.get('outputTokens', 0)
-    total_in += e.get('inputTokens', 0)
-    total_out += e.get('outputTokens', 0)
-
-for model, counts in sorted(models.items()):
-    total = counts['input'] + counts['output']
-    print(f'  {model}')
-    print(f'    Input:  {counts[\"input\"]:>10,} tokens')
-    print(f'    Output: {counts[\"output\"]:>10,} tokens')
-    print(f'    Total:  {total:>10,} tokens')
-    print()
-
-grand = total_in + total_out
-print(f'  Grand Total: {grand:,} tokens ({total_in:,} in / {total_out:,} out)')
-print(f'  Entries: {len(usage)}')
-" 2>/dev/null
+  printf '%s' "$usage" | helper usage-summary 2>/dev/null
   echo ""
 }
 
@@ -1136,28 +1037,7 @@ cmd_logs() {
     if [[ "$line" == data:* ]]; then
       local json="${line#data: }"
       local log_line
-      log_line=$(echo "$json" | python3 -c "
-import sys, json
-try:
-    d = json.load(sys.stdin)
-    tag = d.get('tag', '')
-    line = d.get('line', d.get('msg', ''))
-    # Color coding
-    colors = {
-        'error': '\033[0;31m',     # red
-        'warn': '\033[1;33m',      # yellow
-        'switch': '\033[0;36m',    # cyan
-        'refresh': '\033[0;34m',   # blue
-        'proactive': '\033[0;35m', # magenta
-        'info': '\033[0m',         # default
-        'system': '\033[0;32m',    # green
-    }
-    color = colors.get(tag, '\033[2m')  # dim for unknown
-    reset = '\033[0m'
-    print(f'{color}{line}{reset}')
-except:
-    pass
-" 2>/dev/null)
+      log_line=$(printf '%s' "$json" | helper format-log-line 2>/dev/null)
       if [[ -n "$log_line" ]]; then
         if [[ -z "$filter" ]] || echo "$log_line" | grep -qi "$filter" 2>/dev/null; then
           echo -e "  $log_line"
@@ -1178,6 +1058,9 @@ cmd_help() {
   echo -e "    ${CYAN}list${NC}                    List all saved profiles"
   echo -e "    ${CYAN}switch${NC} [name]           Switch to a profile (interactive if no name)"
   echo -e "    ${CYAN}remove${NC} <name>           Delete a saved profile"
+  echo -e "    ${CYAN}priority${NC} <name> <n>      Set account priority (higher = preferred; 'priority' strategy)"
+  echo -e "    ${CYAN}disable${NC} <name>           Exclude an account from rotation (keeps it saved)"
+  echo -e "    ${CYAN}enable${NC} <name>            Re-include a disabled account in rotation"
   echo -e "    ${CYAN}status${NC}                  Show current account details + settings"
   echo -e "    ${CYAN}config${NC} [key] [on|off]   View or toggle settings (proxy, autoswitch)"
   echo -e "    ${CYAN}dashboard${NC} [start|stop]  Launch/stop the web dashboard"
@@ -1214,6 +1097,9 @@ shift 2>/dev/null || true
 case "$command" in
   add)       cmd_add "$@" ;;
   label)     cmd_label "$@" ;;
+  priority|prio) cmd_priority "$@" ;;
+  disable)   cmd_disable "$@" ;;
+  enable)    cmd_enable "$@" ;;
   list|ls)   cmd_list ;;
   switch|sw) cmd_switch "$@" ;;
   remove|rm) cmd_remove "$@" ;;

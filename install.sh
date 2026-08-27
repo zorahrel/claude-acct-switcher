@@ -34,16 +34,14 @@ if [[ "$NODE_VERSION" -lt 18 ]]; then
 fi
 
 if [[ "$(uname)" != "Darwin" ]]; then
-  echo -e "${RED}This tool requires macOS (uses Keychain for credential storage).${NC}"
+  echo -e "${RED}This installer is for macOS.${NC}"
+  echo "  On Windows, run:  powershell -ExecutionPolicy Bypass -File .\\install.ps1"
   exit 1
 fi
 
-if ! command -v python3 &>/dev/null; then
-  echo -e "${RED}python3 is required but not installed.${NC}"
-  exit 1
-fi
-
-echo -e "  ${GREEN}✓${NC} Prerequisites OK (Node $(node -v), macOS, python3)"
+# python3 is no longer required: the JSON work moved into vdm-helper.mjs, and
+# Node was already a hard dependency.
+echo -e "  ${GREEN}✓${NC} Prerequisites OK (Node $(node -v), macOS)"
 echo ""
 
 # ── Install files ──
@@ -53,7 +51,9 @@ mkdir -p "$INSTALL_DIR/accounts"
 
 cp "$SCRIPT_DIR/dashboard.mjs" "$INSTALL_DIR/dashboard.mjs"
 cp "$SCRIPT_DIR/lib.mjs" "$INSTALL_DIR/lib.mjs"
+cp "$SCRIPT_DIR/platform.mjs" "$INSTALL_DIR/platform.mjs"
 cp "$SCRIPT_DIR/vdm" "$INSTALL_DIR/vdm"
+cp "$SCRIPT_DIR/vdm-helper.mjs" "$INSTALL_DIR/vdm-helper.mjs"
 cp "$SCRIPT_DIR/install-hooks.sh" "$INSTALL_DIR/install-hooks.sh"
 chmod +x "$INSTALL_DIR/vdm"
 

@@ -208,7 +208,10 @@ describe('createAccountStateManager', () => {
 
   it('remove() deletes entry', () => {
     const sm = createAccountStateManager();
-    sm.update('tok1', 'acct1', {});
+    // The headers must carry at least one limit field: an update with none is a
+    // deliberate no-op (an absent header means "said nothing", never zero), so
+    // `update(tok, name, {})` creates nothing to remove.
+    sm.update('tok1', 'acct1', { 'anthropic-ratelimit-unified-status': 'allowed' });
     assert.ok(sm.get('tok1'));
     sm.remove('tok1');
     assert.equal(sm.get('tok1'), undefined);
