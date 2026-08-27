@@ -107,10 +107,20 @@ $binDir = Join-Path $env:USERPROFILE '.local\bin'
 New-Item -ItemType Directory -Force -Path $binDir | Out-Null
 
 $vdmUnix = ($installDir -replace '\\', '/') + '/vdm'
+# chcp 65001 first: the CLI draws its tables with box-drawing characters and
+# arrows, and an Italian (or any non-US) console defaults to cp850, which
+# renders them as "ÔöÇÔöÇÔöÇ". The old code page is restored on the way out so the
+# shim does not leave the user's console reconfigured behind it.
 $shim = @"
 @echo off
 REM Van Damme-o-Matic CLI shim - forwards to the bash script under Git for Windows.
+setlocal
+for /f "tokens=2 delims=:" %%a in ('chcp') do set "_VDM_CP=%%a"
+chcp 65001 >nul
 "$bash" "$vdmUnix" %*
+set "_VDM_EXIT=%ERRORLEVEL%"
+chcp %_VDM_CP% >nul 2>nul
+endlocal & exit /b %_VDM_EXIT%
 "@
 Set-Content -Path (Join-Path $binDir 'vdm.cmd') -Value $shim -Encoding ascii
 Write-Ok "Linked vdm into $binDir"
