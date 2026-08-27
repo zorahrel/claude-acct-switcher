@@ -36,7 +36,7 @@ const now = 1_800_000_000_000;
 const fresh = (over) => ({ updatedAt: now - 60_000, ...over });
 
 test('the regression case: 429, no retry-after, account at 95%', () => {
-  // Exactly what the log showed on attilio@armonia.agency.
+  // Exactly what the log showed on account-a@example.com.
   const r = classify429(0, fresh({ utilization5h: 0.95, utilization7d: 0.64 }), now);
   assert.equal(r.isTransient, false, 'must NOT be dismissed as a transient burst');
   assert.equal(r.looksExhausted, true);

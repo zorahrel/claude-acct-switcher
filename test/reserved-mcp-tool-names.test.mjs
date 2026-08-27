@@ -155,7 +155,7 @@ test('a real extra-usage response stays eligible for failover', () => {
 test('OpenClaw extra-usage replies are isolated from VDM global account state', () => {
   const exactError = "You're out of extra usage. Add more at claude.ai/settings/usage and keep going.";
   const body = Buffer.from(JSON.stringify({
-    system: [{ type: 'text', text: 'You are Claude Code.\nWorking directory: /Users/zorahrel/.openclaw\n' }],
+    system: [{ type: 'text', text: 'You are Claude Code.\nWorking directory: /Users/dev/.openclaw\n' }],
     tools: [{ name: 'mcp__openclaw__web_fetch', input_schema: { type: 'object' } }],
     messages: [{ role: 'user', content: 'hello' }],
   }));
@@ -168,7 +168,7 @@ test('OpenClaw extra-usage replies are isolated from VDM global account state', 
 test('ordinary Claude requests retain normal extra-usage failover', () => {
   const exactError = "You're out of extra usage. Add more at claude.ai/settings/usage and keep going.";
   const body = Buffer.from(JSON.stringify({
-    system: [{ type: 'text', text: 'You are Claude Code.\nWorking directory: /Users/zorahrel/Projects/darkroom\n' }],
+    system: [{ type: 'text', text: 'You are Claude Code.\nWorking directory: /Users/dev/Projects/darkroom\n' }],
     messages: [{ role: 'user', content: 'hello' }],
   }));
 

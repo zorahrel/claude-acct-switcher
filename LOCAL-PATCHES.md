@@ -283,7 +283,7 @@ Anthropic-native counters alongside.
 - a full task (write two modules, write tests, run them, record the outcome) - 8/8 tests
   passing and every file on disk
 - an account switch mid-session while a tool was running: proxy logged
-  `[proactive] attilio@armonia.agency -> switch to zorahrel@gmail.com (priority)`, the
+  `[proactive] account-a@example.com -> switch to account-b@example.com (priority)`, the
   answer arrived normally, no error surfaced to the client
 - attribution finally works: 12 requests and 449k tokens billed to the right account,
   where before all of it read as external usage
@@ -353,7 +353,7 @@ Suite total: **144 green**.
 
 **The symptom that mattered:** jcode, pointed at the proxy, logged eight consecutive 429s
 and gave up, on an account that still had quota. Worse, vdm never switched away from it,
-so `hi@armonia.io` sat at 0% while `attilio@armonia.agency` took every request.
+so `account-c@example.com` sat at 0% while `account-a@example.com` took every request.
 
 **Why the switch never fired.** Anthropic returns this refusal as
 `429 rate_limit_error` **with no `retry-after` header**. In `handleProxyRequest` that
@@ -405,7 +405,7 @@ Fixing the identity was only half of it. `const isTransient = retryAfter < 60` i
 burst: `markAccountLimited` is skipped, no switch fires, the 429 goes back to the client.
 Over the logs, **3389 of ~3500** 429s carried `retry-after: 0` - so the rule was firing
 almost every time, including on genuinely exhausted accounts. That is why
-`attilio@armonia.agency` kept taking traffic at 99% while `hi@armonia.io` sat at 0%.
+`account-a@example.com` kept taking traffic at 99% while `account-c@example.com` sat at 0%.
 
 The 429 branch now cross-checks the reading vdm already holds: a 429 on an account whose
 **fresh** (< 5 min) utilization is **>= 95%** is exhaustion regardless of the header, and
@@ -418,7 +418,7 @@ edge, the 94/95% boundary, 7d-only exhaustion, missing state, and the reset fall
 
 **Verified live**, not just in unit tests: with a temporary 5h cap forcing the active
 account to look unavailable, the proxy logged
-`[proactive] attilio@armonia.agency → switch to zorahrel@gmail.com (priority)` and served
+`[proactive] account-a@example.com → switch to account-b@example.com (priority)` and served
 Opus 200 from the new account. The cap was removed afterwards.
 
 ---
@@ -546,7 +546,7 @@ blocked and it isn't" symptom.
 
 A real 429's `retryAfter` still wins: `accountState.update()` preserves an active cooldown
 by design, because the probe uses a cheap model and cannot see a per-model cap (the weekly
-Opus one). Verified on 11/08: attilio's genuine `quota-7d` cooldown to 12/08 06:00 survived
+Opus one). Verified on 11/08: a genuine `quota-7d` cooldown to 12/08 06:00 survived
 the change.
 
 `unblockSweep` (every 2 min) re-probes only accounts that are `limited` with **no** active
@@ -703,7 +703,7 @@ with a gradient, on mismatched swatch sizes, and on >1px vertical offset.
 
 `.card-top` and `.card-badges` now wrap: adding the third badge ("Cap raggiunto")
 pushed the row past the viewport below ~450px and made the page scroll sideways.
-The layout check caught this the moment armonia first hit its cap.
+The layout check caught this the moment an account first hit its cap.
 
 ### 12. `dashboard.mjs` — two CSS variables that were never defined
 
@@ -781,8 +781,8 @@ OFF, 2.12 ON, against the 1.4 floor the layout check enforces.
 
 ## 2026-08-07 — discovery tracing (diagnostic only, no behaviour change)
 
-Why: after a `/login` as attilio@guedado.it, `vdm list` didn't show the account for ~12
-minutes. The proxy log showed three `[proactive] none → hi@armonia.io (priority)` switches
+Why: after a `/login` as account-d@example.com, `vdm list` didn't show the account for ~12
+minutes. The proxy log showed three `[proactive] none → account-c@example.com (priority)` switches
 (02:35:15, 02:38:55, 02:43:53) before `[auto-discover]` finally saved it as auto-2 at
 02:46:52. `none` means the active keychain token matched no saved account — but
 `autoDiscoverAccount()` runs immediately before the strategy pick on every proxy request
@@ -824,7 +824,7 @@ What was added (UI only, no change to the rotation logic):
   button while the POST is in flight, then re-renders from the server rather than trusting
   optimistic local state
 - a switch on the priority row of each card, right-aligned, with an `ON`/`OFF` caption and an
-  aria-label (`Disable hi@armonia.io`) so it is reachable from a snapshot
+  aria-label (`Disable account-c@example.com`) so it is reachable from a snapshot
 - disabled cards get a `Disabled` badge, dimmed styling and the line "Excluded from
   rotation — the proxy will not pick this account"
 - the `Switch to this account` button is hidden while disabled — the proxy would drop the

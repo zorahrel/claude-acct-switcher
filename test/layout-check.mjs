@@ -1,8 +1,13 @@
 // Layout check for the dashboard, across real viewport widths.
 //
-// NOT a node:test file — it drives a real browser, so it needs the daemon running:
-//     launchctl kickstart -k gui/$(id -u)/com.jarvis.vdm && sleep 5
-//     node test/layout-check.mjs
+// NOT a node:test file — it drives a real browser, so the dashboard must be up:
+//     node dashboard.mjs &
+//     CSW_PORT=3333 node test/layout-check.mjs
+//
+// Playwright is not a dependency of this project (it would be a heavy one for a
+// zero-dependency tool), so this script is opt-in: install it wherever you like
+// and point PLAYWRIGHT_MODULE at it, or `npm i -g playwright` and let the plain
+// import resolve.
 //
 // It fails on: clipped cards, overlapping siblings, elements past the viewport,
 // horizontal page scroll, strip cells thinner than 2px, and any text block that
@@ -10,8 +15,18 @@
 // cap label overlapping the header at all 12 widths, and the tab row forcing a
 // sideways scroll at 360px.
 
-import { chromium } from '/Users/zorahrel/.claude/jarvis/mcp-servers/jarvis-browser/node_modules/playwright/index.mjs';
+// A hardcoded absolute path made this runnable on exactly one machine.
+const PLAYWRIGHT = process.env.PLAYWRIGHT_MODULE || 'playwright';
+let chromium;
+try {
+  ({ chromium } = await import(PLAYWRIGHT));
+} catch {
+  console.error(`Cannot load Playwright from "${PLAYWRIGHT}".`);
+  console.error('Install it (npm i -g playwright) or set PLAYWRIGHT_MODULE to its index.mjs.');
+  process.exit(2);
+}
 
+const DASHBOARD_URL = process.env.VDM_URL || `http://127.0.0.1:${process.env.CSW_PORT || 3333}/`;
 const WIDTHS = [1440, 1280, 1024, 900, 768, 700, 640, 560, 480, 414, 390, 360];
 const browser = await chromium.launch();
 const rows = [];
@@ -19,7 +34,7 @@ let problems = [];
 
 for (const w of WIDTHS) {
   const page = await browser.newPage({ viewport: { width: w, height: 1000 } });
-  await page.goto('http://127.0.0.1:3335/', { waitUntil: 'networkidle' });
+  await page.goto(DASHBOARD_URL, { waitUntil: 'networkidle' });
   await page.waitForSelector('.card', { timeout: 10000 });
   await page.waitForTimeout(400);
 
