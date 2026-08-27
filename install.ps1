@@ -150,18 +150,21 @@ sh.Run """$nodeExe"" ""$dashboardPath""", 0, False
 Set-Content -Path $vbsPath -Value $vbs -Encoding ascii
 
 $taskName = 'VanDammeOMatic'
-try {
-  Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-  $action  = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$vbsPath`""
-  $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-  # Interactive, not SYSTEM: the dashboard must read THIS user's credentials
-  # file and be reachable on this user's loopback.
-  $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive
-  $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
-  Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings | Out-Null
+
+# schtasks.exe, not Register-ScheduledTask.
+#
+# The cmdlet needs a principal, and `New-ScheduledTaskPrincipal -UserId
+# "$env:USERDOMAIN\$env:USERNAME"` fails outright on a machine whose user is a
+# Microsoft account: "No mapping between account names and security IDs was
+# done". That is a common setup, not an exotic one, and it would silently cost
+# the user their auto-start. schtasks defaults to the invoking user and asks no
+# questions.
+$taskRun = 'wscript.exe "' + $vbsPath + '"'
+& schtasks.exe /Create /TN $taskName /TR $taskRun /SC ONLOGON /RL LIMITED /F 2>&1 | Out-Null
+if ($LASTEXITCODE -eq 0) {
   Write-Ok "Dashboard will start automatically at logon"
-} catch {
-  Write-Warn2 "Could not register the logon task: $($_.Exception.Message)"
+} else {
+  Write-Warn2 "Could not register the logon task (exit $LASTEXITCODE)"
   Write-Step  "Start it by hand with: vdm dashboard"
 }
 

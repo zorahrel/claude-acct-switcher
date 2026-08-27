@@ -25,17 +25,40 @@ Van Damme-o-Matic does the splits across multiple accounts so you never have to.
 
 ![Dashboard](VDM.png)
 
+> **This fork runs on Windows as well as macOS.**
+> Upstream is macOS-only, because it keeps credentials in the Keychain. On
+> Windows, Claude Code stores them in `%USERPROFILE%\.claude\.credentials.json`
+> instead, and this fork handles both. It also drops the python3 dependency —
+> everything that needed it is Node now, which was already required.
+
 ## Install
 
+### macOS
+
 ```bash
-git clone https://github.com/loekj/claude-acct-switcher.git
+git clone https://github.com/zorahrel/claude-acct-switcher.git
 cd claude-acct-switcher
 ./install.sh
 ```
 
 Restart your terminal. Done. The proxy auto-starts on new shells.
 
-**Requirements:** macOS, Node.js 18+, python3, Claude Code CLI.
+**Requirements:** Node.js 18+, Claude Code CLI.
+
+### Windows
+
+```powershell
+git clone https://github.com/zorahrel/claude-acct-switcher.git
+cd claude-acct-switcher
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+Open a **new** terminal afterwards, so the updated `PATH` and
+`ANTHROPIC_BASE_URL` apply. The dashboard starts at logon via a scheduled task.
+
+**Requirements:** Node.js 18+, [Git for Windows](https://git-scm.com/download/win)
+(the `vdm` CLI is a bash script and runs under Git's bash), Claude Code CLI.
+No admin rights needed. python3 is *not* required.
 
 ### Upgrade
 
@@ -141,7 +164,9 @@ Claude Code  ──ANTHROPIC_BASE_URL──>  Local Proxy (:3334)  ──>  api.
                                           '-- Circuit breaker auto-disables on repeated failures
 ```
 
-Credentials live in the macOS Keychain. The proxy reads the active token, replaces the auth header, and forwards to Anthropic. On 429, it writes the next account's credentials to the Keychain and retries — Claude Code picks up the change seamlessly.
+Credentials live in the macOS Keychain, or in `%USERPROFILE%\.claude\.credentials.json` on Windows — the same place Claude Code itself keeps them. The proxy reads the active token, replaces the auth header, and forwards to Anthropic. On 429, it writes the next account's credentials and retries — Claude Code picks up the change seamlessly.
+
+On Windows the credentials file is written through a temp file plus an atomic rename, and the `.credentials.json.lock` protocol is honoured, because a live Claude Code session reads that file on every request: a half-written file would kill it. A lock whose owning process is gone is broken rather than waited on.
 
 ### Proxy Resilience
 
@@ -176,6 +201,11 @@ Sessions running in git worktrees are correctly grouped with the parent repo in 
 ```bash
 node --test 'test/*.test.mjs'
 ```
+
+301 tests, no dependencies, and they pass on both macOS and Windows. Line
+endings are pinned to LF by `.gitattributes`: without it, Git for Windows
+rewrites `vdm` with CRLF on clone and the shebang looks for an interpreter
+called `bash\r`.
 
 ## Uninstall
 
