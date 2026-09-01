@@ -14,6 +14,29 @@ survives an upgrade; run it first after re-applying:
 
 ---
 
+## 2026-09-01 - a transport timeout must not escape the VDM proxy
+
+**Symptom:** a burst of `ETIMEDOUT` responses made VDM rotate through every
+saved account, then retry the original client authorization directly against
+Anthropic. After three such failures its circuit breaker kept that passthrough
+mode on for two minutes. The proxy was healthy, but account rotation had been
+silently bypassed.
+
+**Cause:** a TCP/DNS failure happens before Anthropic can inspect a bearer token.
+Changing account cannot repair it, and the final `_passthroughFallback()` used
+the caller's original `Authorization` header instead of VDM's selected account.
+
+**Fix:** the `lastNetworkError` branch retries its selected account once, then
+returns `503` with `Retry-After: 1`. It never switches the Keychain account,
+opens the bypass circuit, or forwards the original authorization. A normal
+credential-recovery fallback remains available for actual authentication cases.
+
+**Regression:** `test/network-fail-closed.test.mjs` pins the live branch: no
+passthrough or account selection, and a retryable `503` that explicitly remains
+on VDM routing.
+
+---
+
 ## 2026-08-26 - `vdm switch` must write compact JSON to Keychain
 
 **Symptom:** immediately after a manual `vdm switch`, both the dashboard and

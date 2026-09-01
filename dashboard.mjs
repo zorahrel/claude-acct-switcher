@@ -8343,33 +8343,23 @@ async function handleProxyRequest(clientReq, clientRes) {
       }
     }
 
-    // Network failure after retry  - try switching to another account before giving up
+    // A transport failure happens before Anthropic can inspect the bearer token.
+    // Rotating accounts therefore cannot recover it; worse, falling back to the
+    // original client auth makes the request silently escape VDM. Keep the
+    // selected account and let the client retry through this proxy instead.
     if (lastNetworkError) {
-      if (settings.autoSwitch || balanceMode) {
-        const next = balanceMode
-          ? await balanceSwitch(triedTokens)
-          : (pickBestAccount(triedTokens) || pickAnyUntried(triedTokens));
-        if (next) {
-          log(balanceMode ? 'balance' : 'switch', `  → network error on ${acctName}, switching to ${next.label || next.name}`);
-          if (!balanceMode) {
-            try {
-              await withSwitchLock(() => {
-                writeKeychain(next.creds);
-                invalidateTokenCache();
-              });
-            } catch (e) {
-              log('warn', `Keychain write failed during network-error switch: ${e.message}`);
-            }
-          }
-          token = next.token;
-          logEvent('auto-switch', { from: acctName, to: next.label || next.name, reason: 'network-error' });
-          continue;
-        }
-      }
-      // All accounts tried or autoSwitch off — try passthrough fallback
-      if (await _passthroughFallback(clientReq, clientRes, body, 'network-error-all-exhausted')) return;
-      clientRes.writeHead(502, { 'Content-Type': 'application/json' });
-      clientRes.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: `Upstream unreachable: ${lastNetworkError.message}` } }));
+      log('error', `Upstream network error on ${acctName}; retaining VDM routing (${lastNetworkError.code || lastNetworkError.message || 'unknown'})`);
+      clientRes.writeHead(503, {
+        'Content-Type': 'application/json',
+        'Retry-After': '1',
+      });
+      clientRes.end(JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'api_error',
+          message: 'Upstream temporarily unreachable; retry through VDM.',
+        },
+      }));
       return;
     }
 
