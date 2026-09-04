@@ -239,8 +239,14 @@ const commands = {
   // fine. `vdm list` used to print a rate-limited account exactly like a healthy
   // one, so the only way to learn that rotation was skipping it was to read
   // account-state.json by hand.
-  'block-state'([file, fp]) {
-    if (!file || !fp) die('block-state needs <state-file> <fingerprint>');
+  'block-state'([file, fp, disabledMarker]) {
+    if (!file || !fp) die('block-state needs <state-file> <fingerprint> [disabled-marker]');
+    // Being switched off outranks any cooldown: the account is not coming back
+    // when the timer runs out, so printing "torna domenica" for it is a lie.
+    if (disabledMarker && existsSync(disabledMarker)) {
+      process.stdout.write('escluso dalla rotazione (riattivabile dalla dashboard)');
+      return;
+    }
     if (!existsSync(file)) return;
     const st = readJsonFile(file)[fp];
     if (!st || !st.limited) return;

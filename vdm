@@ -175,7 +175,7 @@ is_true() {
 
 # One line saying why the proxy skips this account, empty when it is fine.
 get_block_state() {
-  helper block-state "$STATE_FILE" "$1" 2>/dev/null
+  helper block-state "$STATE_FILE" "$1" "$ACCOUNTS_DIR/${2:-}.disabled" 2>/dev/null
 }
 
 # `value` here is a JSON literal (true/false/a number), matching the original
@@ -407,7 +407,7 @@ cmd_list() {
     if [[ -n "$priority" && "$priority" != "0" ]]; then
       echo -e "      ${DIM}priority: $priority${NC}"
     fi
-    local blocked=$(get_block_state "$fp")
+    local blocked=$(get_block_state "$fp" "$name")
     if [[ -n "$blocked" ]]; then
       echo -e "      ${YELLOW}non selezionabile: $blocked${NC}"
     fi
@@ -575,7 +575,7 @@ cmd_status() {
   echo -e "  Tier:     $tier"
   echo -e "  Expires:  $expires"
   echo -e "  Scopes:   ${DIM}$scopes${NC}"
-  local active_blocked=$(get_block_state "$(get_active_fingerprint 2>/dev/null)")
+  local active_blocked=$(get_block_state "$(get_active_fingerprint 2>/dev/null)" "$active_name")
   if [[ -n "$active_blocked" ]]; then
     echo -e "  ${YELLOW}Bloccato: $active_blocked${NC}"
   fi
