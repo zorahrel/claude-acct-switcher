@@ -14,6 +14,7 @@ PROXY_PORT="${CSW_PROXY_PORT:-3334}"
 DASHBOARD_PID_FILE="$SCRIPT_DIR/.dashboard.pid"
 CONFIG_FILE="$SCRIPT_DIR/config.json"
 ACTIVITY_LOG_FILE="$SCRIPT_DIR/activity-log.json"
+STATE_FILE="$SCRIPT_DIR/account-state.json"
 
 # Colors
 RED='\033[0;31m'
@@ -170,6 +171,11 @@ is_true() {
     true|True|TRUE|1) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# One line saying why the proxy skips this account, empty when it is fine.
+get_block_state() {
+  helper block-state "$STATE_FILE" "$1" 2>/dev/null
 }
 
 # `value` here is a JSON literal (true/false/a number), matching the original
@@ -401,6 +407,10 @@ cmd_list() {
     if [[ -n "$priority" && "$priority" != "0" ]]; then
       echo -e "      ${DIM}priority: $priority${NC}"
     fi
+    local blocked=$(get_block_state "$fp")
+    if [[ -n "$blocked" ]]; then
+      echo -e "      ${YELLOW}non selezionabile: $blocked${NC}"
+    fi
   done
 
   echo ""
@@ -565,6 +575,10 @@ cmd_status() {
   echo -e "  Tier:     $tier"
   echo -e "  Expires:  $expires"
   echo -e "  Scopes:   ${DIM}$scopes${NC}"
+  local active_blocked=$(get_block_state "$(get_active_fingerprint 2>/dev/null)")
+  if [[ -n "$active_blocked" ]]; then
+    echo -e "  ${YELLOW}Bloccato: $active_blocked${NC}"
+  fi
 
   # Show proxy/auto-switch status
   local proxy_on=$(get_config_value "proxyEnabled")

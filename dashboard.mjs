@@ -4108,6 +4108,26 @@ function fmtEur(usd) {
   return '€' + Math.round(eur).toLocaleString('it-IT');
 }
 
+// Why the proxy skips an account. Without this the most common block is
+// invisible: a per-model 429 leaves both bars low and the probe still answering
+// "allowed", so the card looked healthy while rotation refused to pick it.
+// No apostrophes in these strings: the page is built from a template literal and
+// a real quote would end the JS string and kill the whole inline script.
+function blockReasonText(p) {
+  const until = p.retryAfter && p.retryAfter > Date.now()
+    ? new Date(p.retryAfter).toLocaleString('it-IT', { weekday: 'short', hour: '2-digit', minute: '2-digit' })
+    : null;
+  let why;
+  switch (p.blockKind) {
+    case 'quota-5h': why = 'Finestra 5h esaurita.'; break;
+    case 'quota-7d': why = 'Finestra settimanale esaurita.'; break;
+    case 'auth':     why = 'Token scaduto: serve un re-login.'; break;
+    case 'model':    why = 'Rate limit sul singolo modello: 429 vero con le due finestre ancora libere, di norma il tetto settimanale di Opus.'; break;
+    default:         why = 'Bloccato dal proxy.'; break;
+  }
+  return why + (until ? ' Torna disponibile ' + until + '.' : '');
+}
+
 /**
  * The chronological strip: one cell per time slice, oldest on the left.
  *
@@ -4260,6 +4280,13 @@ function renderAccounts(profiles, animate) {
       ? '<div class="extra-usage-msg">Anthropic refuses OAuth for the organization of this account (403). It does not expire on its own: an admin must allow Claude Code, or remove the account with <code>vdm remove</code>.</div>'
       : '';
 
+    // Every other block state (rate limit, quota, expired token). These already
+    // stopped rotation from picking the account; until now they said so nowhere.
+    const rateBlocked = !!p.limited && !isOff && !extraUsageBlocked && !permissionBlocked;
+    const rateMsg = rateBlocked
+      ? '<div class="extra-usage-msg">' + blockReasonText(p) + '</div>'
+      : '';
+
     // Per-account cap override. Empty means "inherit the global cap", which the
     // placeholder shows, so an empty box is never ambiguous between "no cap" and
     // "the global one applies".
@@ -4391,12 +4418,14 @@ function renderAccounts(profiles, animate) {
           (isOff ? '<span class="badge badge-off">Disabled</span>' : '') +
           (extraUsageBlocked ? '<span class="badge badge-extra-usage">Extra usage exhausted</span>' : '') +
           (permissionBlocked ? '<span class="badge badge-extra-usage">OAuth not allowed</span>' : '') +
+          (rateBlocked ? '<span class="badge badge-extra-usage">Non selezionabile</span>' : '') +
           (active ? '<span class="badge badge-active">Active</span>' : '') +
         '</div>' +
       '</div>' +
       barsHtml +
       extraUsageMsg +
       permissionMsg +
+      rateMsg +
       // The cap control sits on the priority row: both are knobs that decide whether this
       // account gets picked, so they belong together rather than split across the card.
       priorityRow(capRow) +

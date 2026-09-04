@@ -235,6 +235,29 @@ const commands = {
     writeFileSync(file, `${JSON.stringify(cfg, null, 2)}\n`);
   },
 
+  // Why the proxy will not pick an account, in one line, or nothing when it is
+  // fine. `vdm list` used to print a rate-limited account exactly like a healthy
+  // one, so the only way to learn that rotation was skipping it was to read
+  // account-state.json by hand.
+  'block-state'([file, fp]) {
+    if (!file || !fp) die('block-state needs <state-file> <fingerprint>');
+    if (!existsSync(file)) return;
+    const st = readJsonFile(file)[fp];
+    if (!st || !st.limited) return;
+    const until = st.retryAfter && st.retryAfter > Date.now()
+      ? new Date(st.retryAfter).toLocaleString('it-IT', { weekday: 'short', hour: '2-digit', minute: '2-digit' })
+      : null;
+    const why = {
+      'quota-5h': 'finestra 5h esaurita',
+      'quota-7d': 'finestra settimanale esaurita',
+      'extra-usage': 'extra usage esaurito',
+      'permission': 'OAuth negato per l\'organizzazione',
+      'auth': 'token scaduto',
+      'model': 'rate limit sul singolo modello (429 con le finestre libere: di norma Opus)',
+    }[st.blockKind] || 'bloccato dal proxy';
+    process.stdout.write(`${why}${until ? ` — torna ${until}` : ''}`);
+  },
+
   // One key as a JSON object, for POSTing a single setting to the dashboard.
   'config-one'([file, key]) {
     if (!file || !key) die('config-one needs <file> <key>');
