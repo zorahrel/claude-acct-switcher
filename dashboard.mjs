@@ -9189,3 +9189,36 @@ proxyServer.listen(PROXY_PORT, HOST, () => {
   const s = settings;
   log('info', `API proxy on http://${HOST}:${PROXY_PORT} (proxy=${s.proxyEnabled ? 'on' : 'off'}, auto-switch=${s.autoSwitch ? 'on' : 'off'}, rotation=${s.rotationStrategy || 'conserve'}, ${loadAllAccountTokens().length} accounts)`);
 });
+
+// Lo stesso proxy anche su ::1, il loopback IPv6.
+//
+// Chi punta qui scrive "localhost", non "127.0.0.1" - e' il nome che compare in
+// ogni guida e in ogni file di configurazione. Ma Node risolve localhost in
+// ordine "verbatim" e su questo Mac /etc/hosts elenca ::1 PER PRIMO: la prima
+// connessione va li', dove non ascoltava nessuno, e torna ECONNREFUSED.
+//
+// Claude Code traduce quel codice in «Connection refused - a firewall or proxy
+// may be blocking it», che manda a cercare un firewall inesistente mentre il
+// proxy e' vivo e risponde benissimo un indirizzo piu' in la'. Diagnosticato il
+// 05/09/2026 dopo che le sessioni morivano cosi' senza una ragione visibile.
+//
+// Correggere i client uno per uno non chiude il buco: il prossimo che scrive
+// "localhost" - un file nuovo, un altro strumento, un aggiornamento che rimette
+// il default - ricasca dentro. Il posto dove si risolve una volta sola e' qui.
+//
+// Resta loopback, quindi la ragione per cui HOST e' 127.0.0.1 (non esporre i
+// token Anthropic alla rete locale) vale identica: ::1 non e' raggiungibile da
+// fuori. E se il bind fallisce - IPv6 disattivato sulla macchina, o qualcuno
+// gia' in ascolto - si annota e si tira dritto: il proxy IPv4 e' quello che
+// serve, e morire qui spegnerebbe tutte le sessioni per un di piu'.
+if (HOST === '127.0.0.1') {
+  const proxyServer6 = createServer((clientReq, clientRes) => {
+    proxyServer.emit('request', clientReq, clientRes);
+  });
+  proxyServer6.on('error', (err) => {
+    log('warn', `IPv6 proxy listener not started (${err.code}): clients must use 127.0.0.1, not localhost`);
+  });
+  proxyServer6.listen(PROXY_PORT, '::1', () => {
+    log('info', `API proxy also on http://[::1]:${PROXY_PORT} (so "localhost" works whichever family resolves first)`);
+  });
+}
