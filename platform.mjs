@@ -86,15 +86,37 @@ export function keychainService() {
   return _keychainService;
 }
 
+// `-a` matters: the Keychain keys an item by service AND account, and a lookup
+// by service alone returns whichever item it meets first. On 2026-09-11 Claude
+// Code (a Bun binary, where os.userInfo() answers "unknown" when USER is unset)
+// ran under `env -i` and wrote a blank item under account "unknown". The
+// service-only read returned it for 35 hours: activeToken "missing", no
+// keychain updates on refresh, and every reader downstream stuck on a dead
+// token, while the item this file writes (account = currentUser()) was live.
+function findKeychainItem(account) {
+  const args = ['find-generic-password', '-s', keychainService()];
+  if (account) args.push('-a', account);
+  args.push('-w');
+  return execFileSync('security', args,
+    { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: KEYCHAIN_CMD_TIMEOUT }
+  ).trim();
+}
+
+const KEYCHAIN_ITEM_NOT_FOUND = 44;
+
 function readKeychain() {
   // One retry: a read can lose a race against an external writer (Claude Code's
   // own login rewrites the item), and a second attempt ~50ms later costs nothing.
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const raw = execFileSync('security',
-        ['find-generic-password', '-s', keychainService(), '-w'],
-        { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: KEYCHAIN_CMD_TIMEOUT }
-      ).trim();
+      let raw;
+      try {
+        raw = findKeychainItem(KEYCHAIN_ACCOUNT);
+      } catch (e) {
+        // No item under our account (a login written by another tool): any account.
+        if (e?.status !== KEYCHAIN_ITEM_NOT_FOUND) throw e;
+        raw = findKeychainItem(null);
+      }
       return JSON.parse(raw);
     } catch (e) {
       if (attempt === 0) { sleepSync(50); continue; }

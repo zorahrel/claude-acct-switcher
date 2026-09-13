@@ -14,6 +14,19 @@ survives an upgrade; run it first after re-applying:
 
 ---
 
+## 2026-09-13 — keychain read asks for our own account first
+
+`readKeychain` looked the item up by service only, and the Keychain returns whichever
+`Claude Code-credentials` item it meets first. On 2026-09-11 21:42Z Claude Code 2.1.269
+(a Bun binary: with USER unset `os.userInfo().username` is "unknown") ran under `env -i`,
+found a dead token in the legacy `~/.claude/.credentials.json`, wrote a blank item under
+account "unknown" and deleted the file. For 35 hours vdm read that item: `/health` said
+`activeToken: "missing"`, refreshes stopped updating the keychain, and every downstream
+reader (Topics' native runtime, the jcode mirror) was stuck on a dead token while the item
+vdm writes under `currentUser()` was live. Now the read passes `-a KEYCHAIN_ACCOUNT` and
+falls back to the service-only lookup only when no item exists under that account (exit 44).
+Regression: `test/keychain-account.test.mjs` (fake `security` on PATH; fails on the old read).
+
 ## 2026-09-01 - a transport timeout must not escape the VDM proxy
 
 **Symptom:** a burst of `ETIMEDOUT` responses made VDM rotate through every
