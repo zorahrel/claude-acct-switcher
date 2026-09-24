@@ -33,6 +33,11 @@ const ACCOUNTS_DIR = join(__dirname, 'accounts');
 const STATS_CACHE = join(HOME, '.claude', 'stats-cache.json');
 const CONFIG_FILE = join(__dirname, 'config.json');
 const STATE_FILE = join(__dirname, 'account-state.json');
+// Per-model cooldowns (LOCAL-PATCHES 2026-09-25), up here so nothing can read them before they exist.
+const MODEL_BLOCKS_FILE = join(__dirname, 'model-blocks.json');
+const modelBlocks = createModelBlocks((() => {
+  try { return JSON.parse(readFileSync(MODEL_BLOCKS_FILE, 'utf8')); } catch { return {}; }
+})());
 const TOKEN_USAGE_FILE = join(__dirname, 'token-usage.json');
 const SESSION_HISTORY_FILE = join(__dirname, 'session-history.json');
 const KEYCHAIN_ACCOUNT = currentUser();
@@ -708,6 +713,11 @@ import {
   effectiveUtilization,
   ROTATION_STRATEGIES,
   ROTATION_INTERVALS,
+  isSelectableAccount as _isSelectableAccount,
+  requestModelKey,
+  isPerModel429,
+  createModelBlocks,
+  isMisfiledModelCooldown,
 } from './lib.mjs';
 
 // Fetch email from Anthropic roles API using OAuth token
@@ -1355,6 +1365,8 @@ async function loadProfiles() {
         limited: blockKind !== null,
         retryAfter: acctSt?.retryAfter || 0,
         blockKind, // null | 'quota-5h' | 'quota-7d' | 'extra-usage' | 'permission' | 'model' | 'disabled' | 'auth'
+        // Models this account can't serve right now; it still serves the others (LOCAL-PATCHES 2026-09-25).
+        modelBlocks: modelBlocks.active(name).map(b => ({ key: b.model, label: modelLabel(b.model), until: b.until })),
         myTokens5h: mine.t5,
         myTokens7d: mine.t7,
         // What the caps are and whether they've bitten, for the card + the badge.
@@ -4288,6 +4300,13 @@ function renderAccounts(profiles, animate) {
       ? '<div class="extra-usage-msg">' + blockReasonText(p) + '</div>'
       : '';
 
+    // A model's wall is a note, not a block: the account keeps serving the other models.
+    const modelMsg = (p.modelBlocks || []).length && !isOff
+      ? '<div class="extra-usage-msg" data-model-blocks>In pausa solo per ' + p.modelBlocks.map(function (b) {
+          return escHtml(b.label) + ' fino a ' + new Date(b.until).toLocaleString('it-IT', { weekday: 'short', hour: '2-digit', minute: '2-digit' });
+        }).join(', ') + '. Gli altri modelli continuano su questo account.</div>'
+      : '';
+
     // Per-account cap override. Empty means "inherit the global cap", which the
     // placeholder shows, so an empty box is never ambiguous between "no cap" and
     // "the global one applies".
@@ -4427,6 +4446,7 @@ function renderAccounts(profiles, animate) {
       extraUsageMsg +
       permissionMsg +
       rateMsg +
+      modelMsg +
       // The cap control sits on the priority row: both are knobs that decide whether this
       // account gets picked, so they belong together rather than split across the card.
       priorityRow(capRow) +
@@ -6066,6 +6086,60 @@ function markAccountLimited(token, name, retryAfterSec = 0, blockKind = 'model')
   } catch { /* best-effort persistence */ }
 }
 
+// ── Per-model cooldowns (LOCAL-PATCHES 2026-09-25) ──
+// A model's wall (isPerModel429 in lib.mjs) is kept here, by account name, instead of
+// in the account-wide cooldown: requests for that model skip the account, every other
+// model keeps using it. Persisted (model-blocks.json) so a restart doesn't send the next
+// request into it.
+function markModelLimited(name, key, retryAfterSec) {
+  modelBlocks.mark(name, key, retryAfterSec);
+  try { writeFileSync(MODEL_BLOCKS_FILE, JSON.stringify(modelBlocks.toJSON()), { mode: 0o600 }); } catch { /* best-effort */ }
+}
+
+/**
+ * The tokens of the accounts whose allowance for this model is spent. One request every
+ * MODEL_BLOCK_RETRY_MS is let through to test a paused account: a 429 can claim days and
+ * be wrong, and a 2xx for that model lifts the pause (see the success path).
+ */
+function tokensBlockedForModel(accounts, key) {
+  const names = modelBlocks.blockedNames(key);
+  const out = new Set();
+  for (const a of accounts) {
+    if (!names.has(a.name)) continue;
+    if (modelBlocks.probeDue(a.name, key)) {
+      modelBlocks.markProbe(a.name, key);
+      log('model', `${a.label || a.name}: trying ${key} again (paused until ${whenBack(modelBlocks.until(a.name, key))})`);
+      continue;
+    }
+    out.add(a.token);
+  }
+  return out;
+}
+
+/** A 2xx for a paused model: the wall is gone, whatever its retry-after said. */
+function liftModelLimit(acct, acctName, key) {
+  if (!acct || !key || !modelBlocks.clear(acct.name, key)) return;
+  try { writeFileSync(MODEL_BLOCKS_FILE, JSON.stringify(modelBlocks.toJSON()), { mode: 0o600 }); } catch { /* best-effort */ }
+  logEvent('model-recovered', { account: acctName, model: key });
+  log('model', `${acctName}: ${key} answered again — pause lifted`);
+}
+
+const MODEL_NAMES = { opus: 'Opus', sonnet: 'Sonnet', haiku: 'Haiku', fable: 'Fable' };
+function modelLabel(key) {
+  const [family, oneM] = String(key).split('-');
+  return `${MODEL_NAMES[family] || family}${oneM ? ' (contesto 1M)' : ''}`;
+}
+function whenBack(ms) {
+  return new Date(ms).toLocaleString('it-IT', { weekday: 'short', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+}
+
+/** The 429 for a model this account can't serve: filed on the model, the account stays in rotation. */
+function fileModelLimit(acct, acctName, key, retryAfter) {
+  markModelLimited(acct.name, key, retryAfter);
+  logEvent('model-limited', { account: acctName, model: key, retryAfter });
+  log('switch', `${acctName} → 429 on ${key} only (retry-after: ${retryAfter}s, plan windows free) — back for ${key} ${whenBack(Date.now() + retryAfter * 1000)}, other models keep this account`);
+}
+
 function markAccountExpired(token, name) {
   accountState.markExpired(token, name);
 }
@@ -6235,9 +6309,16 @@ function invalidateAccountsCache() {
       const fp = getFingerprintFromToken(acct.token);
       const ps = persistedState[fp];
       if (!ps) continue;
-      accountState.hydrate(acct.token, acct.name, ps);
+      // Before 2026-09-25 a model's wall was filed as the account's own cooldown, which kept
+      // the account out for every model until the weekly reset. Drop those: the next request
+      // for that model files the wall again, scoped to the model.
+      const misfiled = isMisfiledModelCooldown(ps, now);
+      accountState.hydrate(acct.token, acct.name, misfiled ? { ...ps, limited: false, retryAfter: 0, blockKind: null } : ps);
       restored++;
-      if (ps.retryAfter && ps.retryAfter > now) {
+      if (misfiled) {
+        updatePersistedState(fp, { limited: false, retryAfter: 0, blockKind: null });
+        log('info', `${acct.label || acct.name}: dropped an account-wide cooldown with free plan windows (${formatDuration(ps.retryAfter - now)} left): it was one model's limit`);
+      } else if (ps.retryAfter && ps.retryAfter > now) {
         accountState.markLimited(acct.token, acct.name, Math.ceil((ps.retryAfter - now) / 1000), ps.blockKind || 'model');
       }
     }
@@ -8092,6 +8173,8 @@ async function handleProxyRequest(clientReq, clientRes) {
     } catch { /* not JSON: forward untouched and let upstream reject it */ }
   }
   body = ensureClaudeCodeIdentity(clientReq.url, body);
+  // The allowance this request draws on, for per-model walls (LOCAL-PATCHES 2026-09-25).
+  const _modelKey = requestModelKey(body, clientReq.headers);
   // `let`, not `const`: a usage-cap hold legitimately parks the request for minutes,
   // and the deadline is pushed out by however long we waited so the retry loop below
   // doesn't immediately declare the request stale for time it did not spend working.
@@ -8116,7 +8199,12 @@ async function handleProxyRequest(clientReq, clientRes) {
   }
 
   const maxAttempts = allAccounts.length + 2; // +1 for refresh retry, +1 for minimal-header retry
-  const triedTokens = new Set();
+  // Accounts whose allowance for this model is spent are never tried for it: they count as
+  // already tried, so every picker below skips them (LOCAL-PATCHES 2026-09-25).
+  const _modelExcluded = tokensBlockedForModel(allAccounts, _modelKey);
+  const triedTokens = new Set(_modelExcluded);
+  // The upstream 429 of a model's wall met on the way, handed back if nothing else can serve.
+  let _modelWall = null;
   const billingMarkedTokens = new Set(); // tokens marked billing-unavailable this request
   const refreshAttempted = new Set(); // track refresh attempts to prevent infinite loops
   let _bulkRefreshAttempted = false;   // per-request: tried force-refreshing all tokens?
@@ -8211,11 +8299,25 @@ async function handleProxyRequest(clientReq, clientRes) {
     }
   }
 
+  // Every account that could serve this request has spent this model's allowance: say so
+  // now, with the model and when it comes back. Parking it would wait days on a wall only
+  // this model has, while the other models are free (LOCAL-PATCHES 2026-09-25).
+  if (_modelExcluded.size && !allAccounts.some(a => _isSelectableAccount(a, accountState, _modelExcluded))) {
+    const names = [...modelBlocks.blockedNames(_modelKey)];
+    const back = Math.min(...names.map(n => modelBlocks.until(n, _modelKey)).filter(Boolean));
+    const labels = allAccounts.filter(a => names.includes(a.name)).map(a => a.label || a.name);
+    const message = `${modelLabel(_modelKey)}: limite del modello raggiunto su ${labels.join(', ')} (torna ${whenBack(back)}), e nessun altro account è disponibile. Gli altri modelli funzionano: cambia modello con /model.`;
+    log('model', `${_modelKey}: no account left for this model — returning 429 now instead of holding`);
+    clientRes.writeHead(429, { 'Content-Type': 'application/json' });
+    clientRes.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message } }));
+    return;
+  }
+
   if (balanceMode) {
     // Spread load across accounts by least in-flight count; no keychain write
     // (the active pointer stays stable). If no account is available, fall through
     // with the keychain token — the retry loop's exhausted path handles it.
-    const slot = await acquireBalanceSlot(allAccounts, new Set());
+    const slot = await acquireBalanceSlot(allAccounts, new Set(_modelExcluded));
     if (slot) {
       token = slot.account.token;
       heldKey = slot.account.name;
@@ -8233,7 +8335,7 @@ async function handleProxyRequest(clientReq, clientRes) {
       lastRotationTime,
       accounts: allAccounts,
       stateManager: accountState,
-      excludeTokens: new Set(),
+      excludeTokens: new Set(_modelExcluded),
     });
 
     if (strategyPick) {
@@ -8410,6 +8512,8 @@ async function handleProxyRequest(clientReq, clientRes) {
           balanceCoolDown(coolName, Math.max(retryAfter, BALANCE_MIN_COOLDOWN_SEC));
           logEvent('balance-cooldown', { account: acctName, retryAfter });
           log('balance', `${acctName} → 429 transient (retry-after ${retryAfter}s) — backing off, switching account`);
+        } else if (_modelKey && acct && isPerModel429({ retryAfter, headers: proxyRes.headers, state: accountState.get(token) })) {
+          fileModelLimit(acct, acctName, _modelKey, retryAfter);
         } else {
           // Genuine rate limit — mark limited so the UI/telemetry reflect it.
           markAccountLimited(token, acctName, retryAfter);
@@ -8466,8 +8570,12 @@ async function handleProxyRequest(clientReq, clientRes) {
       const _util = Math.max(_st?.utilization5h || 0, _st?.utilization7d || 0);
       const _looksExhausted = _stateAge < 5 * 60 * 1000 && _util >= 0.95;
       const isTransient = retryAfter < 60 && !_looksExhausted;
+      // A long wall with the plan windows free is this model's, not the account's (LOCAL-PATCHES 2026-09-25).
+      const _perModel = !isTransient && !!_modelKey && !!acct && isPerModel429({ retryAfter, headers: proxyRes.headers, state: _st });
 
-      if (!isTransient) {
+      if (_perModel) {
+        fileModelLimit(acct, acctName, _modelKey, retryAfter);
+      } else if (!isTransient) {
         // No retry-after to trust: hold it until its own reset, or 5 min if even
         // that is unknown, rather than inventing a long cooldown.
         const _effectiveRetry = retryAfter > 0
@@ -8479,7 +8587,7 @@ async function handleProxyRequest(clientReq, clientRes) {
         markAccountLimited(token, acctName, _effectiveRetry);
         logEvent('rate-limited', { account: acctName, retryAfter: _effectiveRetry });
       }
-      log('switch', `${acctName} → 429 ${isTransient ? 'transient' : 'rate limited'} (retry-after: ${retryAfter}s)`);
+      if (!_perModel) log('switch', `${acctName} → 429 ${isTransient ? 'transient' : 'rate limited'} (retry-after: ${retryAfter}s)`);
 
       if (!settings.autoSwitch || isTransient) {
         if (!isTransient) log('switch', '  → auto-switch OFF, returning 429 as-is');
@@ -8490,7 +8598,13 @@ async function handleProxyRequest(clientReq, clientRes) {
         return;
       }
 
-      await drainResponse(proxyRes);
+      const _upBody = await drainResponse(proxyRes);
+      if (_perModel) {
+        _modelWall = { headers: { ...proxyRes.headers }, body: _upBody };
+        // Anthropic's own words name the wall: kept in the log, where the next doubt starts.
+        const said = _upBody.toString('utf8').replace(/\s+/g, ' ').slice(0, 300);
+        if (said.startsWith('{')) log('switch', `  upstream said: ${said}`);
+      }
 
       // Try next best account
       const next = pickBestAccount(triedTokens) || pickAnyUntried(triedTokens);
@@ -8509,6 +8623,18 @@ async function handleProxyRequest(clientReq, clientRes) {
         logEvent('auto-switch', { from: acctName, to: next.label || next.name, reason: '429' });
         notify('Account Switched', `${acctName} rate-limited → ${next.label || next.name}`);
         continue;
+      }
+
+      // No other account for this model: hand back Anthropic's 429 as it came, since it names
+      // the model and when it returns, and the other models stay free (LOCAL-PATCHES 2026-09-25).
+      if (_modelWall) {
+        log('switch', `  → no other account for ${_modelKey}, returning the upstream 429`);
+        const upHeaders = _modelWall.headers;
+        delete upHeaders['content-length'];
+        delete upHeaders['transfer-encoding'];
+        clientRes.writeHead(429, upHeaders);
+        clientRes.end(_modelWall.body);
+        return;
       }
 
       // All exhausted
@@ -8811,6 +8937,7 @@ async function handleProxyRequest(clientReq, clientRes) {
         if (refreshedAcct && refreshedAcct.token !== token) {
           token = refreshedAcct.token;
           triedTokens.clear(); // all tokens changed — retry everything
+          for (const t of tokensBlockedForModel(allAccounts, _modelKey)) triedTokens.add(t); // but not into this model's walls
           continue;
         }
       }
@@ -9011,6 +9138,7 @@ async function handleProxyRequest(clientReq, clientRes) {
     _consecutive400s = 0; // reset on any non-400 response
     _consecutiveExhausted = 0;
     updateAccountState(token, acctName, proxyRes.headers, getFingerprintFromToken(token));
+    if (status >= 200 && status < 300) liftModelLimit(acct, acctName, _modelKey);
 
     // Check if utilization is critically high and log a warning (only at 90%, 95%, 100%)
     const u5h = parseFloat(proxyRes.headers['anthropic-ratelimit-unified-5h-utilization'] || '0');

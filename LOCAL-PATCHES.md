@@ -14,6 +14,46 @@ survives an upgrade; run it first after re-applying:
 
 ---
 
+## 2026-09-25 - a 429 on one model froze the whole account, and every session, for 5 days
+
+**Symptom:** every Claude Code session hung. The log repeated `holding request — 1 account
+over cap, 2 rate-limited; waiting up to 24h`, and `vdm list` marked account-a@example.com
+"non selezionabile" until Wednesday. Yet that account had room: 5h at 2%, 7d at 0%.
+
+**Cause:** at 00:22 Anthropic answered one request 429 with `retry-after: 452236` (5.2
+days, exactly the weekly reset) while both plan windows were free. That shape is a wall on
+ONE model (a weekly model cap, the 1M-context variant), not on the account. VDM filed it as
+the account's own cooldown: out of rotation for every model, and with the other two
+accounts genuinely spent (account-b@example.com at 7d 100%, the third account over its own 27% cap) the
+hold gate parked every request. The Haiku probe cannot lift an Opus cooldown by design, so
+nothing would have cleared it before Wednesday. And the 429 was not even durable:
+`opus[1m]` answered on the same account half an hour later.
+
+**Fix:**
+- `lib.mjs`: `requestModelKey` (model family, `-1m` with the 1M beta), `isPerModel429`
+  (retry-after >= 1h and plan windows < 90%, read from the 429's own headers or a reading
+  under 30 min old), `createModelBlocks` (pauses by account NAME, which survives token
+  refreshes; one request every 10 min tests a pause again), `isMisfiledModelCooldown`.
+- `dashboard.mjs`: a per-model 429 is filed in `model-blocks.json`, not as the account's
+  cooldown; requests for that model count paused accounts as already tried (every picker,
+  the strategy pick, the balance slot, the bulk-refresh reset); a 2xx for that model lifts
+  the pause; if no account is left for the model, the answer is a 429 NOW naming the model
+  and when it returns (or Anthropic's own 429, logged with its body), never a 24h hold. At
+  startup, a persisted account-wide `model` cooldown with free windows and >= 1h left is
+  dropped. The card shows "In pausa solo per ... Gli altri modelli continuano".
+- `vdm` + `vdm-helper.mjs`: `vdm list` prints the per-model pauses; `block-state` reads the
+  windows before trusting kind `model`, which every account-wide 429 used to be filed as
+  (account-b@example.com at 7d 100% read "rate limit sul singolo modello").
+
+**Proof:** `node --test "test/*.test.mjs"` → 313 pass, 2 fail (both pre-existing: they read
+`install.sh`/`uninstall.sh`, which are not in this directory). `test/model-blocks.test.mjs`
+(9 checks, the incident's own numbers) was watched failing first. After the kickstart the
+log reads `account-a@example.com: dropped an account-wide cooldown with free plan windows
+(125.1h left)`, and `claude -p` through the proxy on `opus[1m]` answered in 6.8 s, exit 0.
+Backups: `*.bak-20260925-model-blocks` for all four files.
+
+---
+
 ## 2026-09-13 — keychain read asks for our own account first
 
 `readKeychain` looked the item up by service only, and the Keychain returns whichever

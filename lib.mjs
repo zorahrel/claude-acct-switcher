@@ -469,6 +469,141 @@ export function isSelectableAccount(a, stateManager, excludeTokens = new Set(), 
 }
 
 // ─────────────────────────────────────────────────
+// Per-model cooldowns (LOCAL-PATCHES 2026-09-25)
+// ─────────────────────────────────────────────────
+//
+// A 429 can be a wall on ONE model (the weekly Opus cap, the 1M-context variant)
+// while the account's plan windows still have room: Anthropic keeps serving the
+// other models there. Filed as an account-wide cooldown, it took account-a@example.com
+// out of rotation for every model and every session for 5.2 days, with 5h at 2%
+// and 7d at 0%. These pieces scope such a wall to the model that hit it.
+
+/** Below this a wall is a burst or a window, not a model's allowance (those reset with the week). */
+const MODEL_LIMIT_MIN_RETRY_SEC = 3600;
+/** A stored reading older than this can't vouch for the windows being free. */
+const MODEL_LIMIT_FRESH_MS = 30 * 60 * 1000;
+/** Windows at or above this are the account's own limit, whatever the retry-after. */
+const WINDOW_FULL = 0.9;
+/**
+ * How often one request tests a paused model again. A 429 can claim days and be wrong:
+ * the one that froze account-a@example.com claimed 5.2 days, and opus[1m] answered there
+ * half an hour later.
+ */
+export const MODEL_BLOCK_RETRY_MS = 10 * 60 * 1000;
+
+/**
+ * The allowance a request draws on, as a per-model limit sees it: the model family
+ * ("opus", "sonnet", "haiku", "fable"), plus "-1m" when the 1M-context beta is on.
+ * "" when the body names no model: such a request is never held back by a model block.
+ * Reads the head of the body first: Claude Code puts `model` first, and a 1M-context
+ * body can be megabytes.
+ */
+export function requestModelKey(body, headers = {}) {
+  if (!body || !body.length) return '';
+  let model = '';
+  try {
+    model = (body.toString('utf8', 0, Math.min(body.length, 4096)).match(/"model"\s*:\s*"([^"]+)"/) || [])[1] || '';
+    if (!model) model = String(JSON.parse(body.toString('utf8'))?.model || '');
+  } catch {
+    return '';
+  }
+  const family = (model.toLowerCase().match(/opus|sonnet|haiku|fable/) || [''])[0];
+  if (!family) return '';
+  const oneM = /context-1m/i.test(String(headers['anthropic-beta'] || '')) || /\[1m\]/i.test(model);
+  return oneM ? `${family}-1m` : family;
+}
+
+/**
+ * Whether a 429 is a wall on the requested model rather than on the account: a long
+ * retry-after while the plan windows are below 90%. The windows are read from the 429
+ * itself when it carries them, else from a stored reading at most 30 minutes old; with
+ * neither the answer is no, and the account-wide rule applies as before.
+ */
+export function isPerModel429({ retryAfter, headers = {}, state, now = Date.now() }) {
+  if (!(retryAfter >= MODEL_LIMIT_MIN_RETRY_SEC)) return false;
+  const fresh = !!state?.updatedAt && now - state.updatedAt < MODEL_LIMIT_FRESH_MS;
+  const read = (header, stored) => {
+    const v = parseFloat(headers[header]);
+    if (Number.isFinite(v)) return v;
+    return fresh ? (stored || 0) : null;
+  };
+  const u5 = read('anthropic-ratelimit-unified-5h-utilization', state?.utilization5h);
+  const u7 = read('anthropic-ratelimit-unified-7d-utilization', state?.utilization7d);
+  if (u5 === null && u7 === null) return false;
+  return Math.max(u5 ?? 0, u7 ?? 0) < WINDOW_FULL;
+}
+
+/**
+ * Per-model cooldowns, keyed by account NAME (it survives a token refresh, a
+ * fingerprint does not): `{ [name]: { [modelKey]: untilMs } }`, plain JSON in and out
+ * so the dashboard can persist it as it is.
+ */
+export function createModelBlocks(initial = {}) {
+  const blocks = new Map(Object.entries(initial || {}).map(([name, m]) => [name, { ...m }]));
+  // When each pause was last tried, in memory only: after a restart the first request tests it.
+  const tried = new Map();
+  const slot = (name, key) => `${name}\u0000${key}`;
+  return {
+    mark(name, key, retryAfterSec, now = Date.now()) {
+      if (!name || !key) return;
+      blocks.set(name, { ...(blocks.get(name) || {}), [key]: now + retryAfterSec * 1000 });
+      tried.set(slot(name, key), now); // the 429 itself was the try
+    },
+    clear(name, key) {
+      const m = blocks.get(name);
+      if (!m || !(key in m)) return false;
+      delete m[key];
+      if (!Object.keys(m).length) blocks.delete(name);
+      tried.delete(slot(name, key));
+      return true;
+    },
+    /** Whether a request for this model may test the paused account again: one every `everyMs`. */
+    probeDue(name, key, now = Date.now(), everyMs = MODEL_BLOCK_RETRY_MS) {
+      return now - (tried.get(slot(name, key)) ?? -Infinity) >= everyMs;
+    },
+    markProbe(name, key, now = Date.now()) {
+      tried.set(slot(name, key), now);
+    },
+    until(name, key, now = Date.now()) {
+      const u = blocks.get(name)?.[key] || 0;
+      return u > now ? u : 0;
+    },
+    blockedNames(key, now = Date.now()) {
+      const out = new Set();
+      if (!key) return out;
+      for (const [name, m] of blocks) if ((m[key] || 0) > now) out.add(name);
+      return out;
+    },
+    /** The models an account is paused for, soonest back first. */
+    active(name, now = Date.now()) {
+      return Object.entries(blocks.get(name) || {})
+        .filter(([, until]) => until > now)
+        .map(([model, until]) => ({ model, until }))
+        .sort((a, b) => a.until - b.until);
+    },
+    toJSON(now = Date.now()) {
+      const out = {};
+      for (const [name, m] of blocks) {
+        const live = Object.fromEntries(Object.entries(m).filter(([, until]) => until > now));
+        if (Object.keys(live).length) out[name] = live;
+      }
+      return out;
+    },
+  };
+}
+
+/**
+ * A cooldown persisted before the fix that was really a model's wall: kind 'model',
+ * account-wide, at least an hour left, plan windows free. Dropped at startup; the next
+ * request for that model files it again, this time where it belongs.
+ */
+export function isMisfiledModelCooldown(ps, now = Date.now()) {
+  return ps?.blockKind === 'model'
+    && (ps.retryAfter || 0) - now >= MODEL_LIMIT_MIN_RETRY_SEC * 1000
+    && Math.max(ps.utilization5h || 0, ps.utilization7d || 0) < WINDOW_FULL;
+}
+
+// ─────────────────────────────────────────────────
 // Account availability & selection
 // ─────────────────────────────────────────────────
 

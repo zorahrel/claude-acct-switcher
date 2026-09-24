@@ -253,6 +253,11 @@ const commands = {
     const until = st.retryAfter && st.retryAfter > Date.now()
       ? new Date(st.retryAfter).toLocaleString('it-IT', { weekday: 'short', hour: '2-digit', minute: '2-digit' })
       : null;
+    // 'model' is also what every account-wide 429 used to be filed as: read the windows
+    // first, as the dashboard does, so a full week is not called a single model's limit.
+    const kind = (!st.blockKind || st.blockKind === 'model')
+      ? ((st.utilization5h || 0) >= 0.9 ? 'quota-5h' : (st.utilization7d || 0) >= 0.9 ? 'quota-7d' : st.blockKind)
+      : st.blockKind;
     const why = {
       'quota-5h': 'finestra 5h esaurita',
       'quota-7d': 'finestra settimanale esaurita',
@@ -260,8 +265,26 @@ const commands = {
       'permission': 'OAuth negato per l\'organizzazione',
       'auth': 'token scaduto',
       'model': 'rate limit sul singolo modello (429 con le finestre libere: di norma Opus)',
-    }[st.blockKind] || 'bloccato dal proxy';
+    }[kind] || 'bloccato dal proxy';
     process.stdout.write(`${why}${until ? ` — torna ${until}` : ''}`);
+  },
+
+  // The models an account is paused for, while it keeps serving the others
+  // (LOCAL-PATCHES 2026-09-25). Nothing when it is paused for none.
+  'model-blocks'([file, name]) {
+    if (!file || !name) die('model-blocks needs <model-blocks-file> <account-name>');
+    if (!existsSync(file)) return;
+    const names = { opus: 'Opus', sonnet: 'Sonnet', haiku: 'Haiku', fable: 'Fable' };
+    const now = Date.now();
+    const paused = Object.entries(readJsonFile(file)[name] || {})
+      .filter(([, until]) => until > now)
+      .sort((a, b) => a[1] - b[1])
+      .map(([key, until]) => {
+        const [family, oneM] = key.split('-');
+        const when = new Date(until).toLocaleString('it-IT', { weekday: 'short', hour: '2-digit', minute: '2-digit' });
+        return `${names[family] || family}${oneM ? ' (contesto 1M)' : ''} fino a ${when}`;
+      });
+    process.stdout.write(paused.join(', '));
   },
 
   // One key as a JSON object, for POSTing a single setting to the dashboard.

@@ -411,6 +411,10 @@ cmd_list() {
     if [[ -n "$blocked" ]]; then
       echo -e "      ${YELLOW}non selezionabile: $blocked${NC}"
     fi
+    local paused=$(helper model-blocks "$SCRIPT_DIR/model-blocks.json" "$name" 2>/dev/null)
+    if [[ -n "$paused" ]]; then
+      echo -e "      ${DIM}in pausa solo per: $paused (gli altri modelli restano)${NC}"
+    fi
   done
 
   echo ""
