@@ -718,6 +718,7 @@ import {
   isPerModel429,
   createModelBlocks,
   isMisfiledModelCooldown,
+  accountFreeAt,
 } from './lib.mjs';
 
 // Fetch email from Anthropic roles API using OAuth token
@@ -6411,8 +6412,8 @@ function holdOutlook() {
     }
     if (!isAccountAvailable(a.token, a.expiresAt)) {
       limited++;
-      const st = accountState.get(a.token);
-      const at = st?.retryAfter || (st?.resetAt ? st.resetAt * 1000 : 0);
+      // The instant isAccountAvailable flips, not the cooldown alone (LOCAL-PATCHES 2026-09-25).
+      const at = accountFreeAt(accountState.get(a.token));
       if (at > now) earliest = Math.min(earliest, at);
     }
   }

@@ -624,6 +624,19 @@ export function isAccountAvailable(token, expiresAt, stateManager, now = Date.no
   return true;
 }
 
+/**
+ * The first instant a limited account passes isAccountAvailable again: after its
+ * cooldown AND after the second of its window reset (that check reads
+ * `resetAt >= nowSec`). 0 when neither is known. A hold that ends on the cooldown
+ * alone ended one second early, and every parked request got a 429 at the very
+ * reset it was waiting for (LOCAL-PATCHES 2026-09-25).
+ */
+export function accountFreeAt(st) {
+  const afterCooldown = st?.retryAfter ? st.retryAfter + 1 : 0;
+  const afterReset = st?.resetAt ? (st.resetAt + 1) * 1000 : 0;
+  return Math.max(afterCooldown, afterReset);
+}
+
 export function scoreAccount(token, stateManager) {
   const acctState = stateManager.get(token);
   if (!acctState) return 0; // unknown = fresh, try first

@@ -14,6 +14,27 @@ survives an upgrade; run it first after re-applying:
 
 ---
 
+## 2026-09-25 (later) - the hold let go one second before the account came back
+
+**Symptom:** at every 5h reset of the day (05:20, 10:20) every parked request got
+`hold expired after Nmin — returning 429` instead of resuming, and requests arriving in
+that same second were parked for `0s` and failed too. Claude Code retried its way out,
+but each reset turned a clean resume into a burst of errors.
+
+**Cause:** `holdOutlook()` ended the hold at the account's `retryAfter` (a 429 at 14:31:16
+with retry-after 2923s → 15:19:59.x), while `isAccountAvailable()` also waits out the
+reset second (`resetAt >= nowSec`, resetAt = 15:20:00). The final check of the wait ran
+inside that gap, found nothing selectable, and answered 429.
+
+**Fix:** `accountFreeAt()` in `lib.mjs` returns the first instant `isAccountAvailable()`
+flips: max(retryAfter + 1 ms, (resetAt + 1) s). `holdOutlook()` uses it.
+
+**Proof:** `test/hold-release.test.mjs` (4 checks) was run against the old formula first:
+3 fail. Suite 323/323. Live: the kickstart at 14:57 re-parked 16 waiting sessions; the
+15:20 reset is the check (see the log line `released after ... — resuming`).
+
+---
+
 ## 2026-09-25 - a 429 on one model froze the whole account, and every session, for 5 days
 
 **Symptom:** every Claude Code session hung. The log repeated `holding request — 1 account
