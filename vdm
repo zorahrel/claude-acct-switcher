@@ -747,10 +747,10 @@ cmd_config() {
     fi
   elif [[ "$key" == "rotationStrategy" ]]; then
     case "$value" in
-      sticky|conserve|round-robin|spread|drain-first|balance) ;;
+      sticky|conserve|round-robin|spread|drain-first|balance|priority) ;;
       *)
         echo -e "${RED}Invalid strategy: $value${NC}"
-        echo "  Options: sticky, conserve, round-robin, spread, drain-first, balance"
+        echo "  Options: sticky, conserve, round-robin, spread, drain-first, balance, priority"
         return 1
         ;;
     esac
